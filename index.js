@@ -20,6 +20,41 @@ const SUCCESS_REDIRECT_URI = process.env.SUCCESS_REDIRECT_URI;
 const PATREON_API_USER_AGENT =
   process.env.PATREON_API_USER_AGENT ||
   'TGV9173-patreon-checker/1.0 (+https://patreon-checker.onrender.com)';
+// Only count tiers from this campaign’s membership (recommended). Find ID in Patreon creator dashboard URL or API.
+const PATREON_CAMPAIGN_ID = (process.env.PATREON_CAMPAIGN_ID || '').trim();
+const PATREON_HTTP_TIMEOUT_MS = Number(process.env.PATREON_HTTP_TIMEOUT_MS || 45000);
+
+/** Retries Patreon HTTP calls on timeouts / 502–504 (common when their edge is slow). */
+async function patreonRequest(label, axiosCall) {
+  const maxAttempts = 3;
+  let lastErr;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      return await axiosCall();
+    } catch (err) {
+      lastErr = err;
+      const ax = err.response;
+      const bodyStr = typeof ax?.data === 'string' ? ax.data : '';
+      const retry =
+        attempt < maxAttempts &&
+        (err.code === 'ECONNABORTED' ||
+          err.code === 'ETIMEDOUT' ||
+          err.code === 'ECONNRESET' ||
+          err.code === 'EAI_AGAIN' ||
+          ax?.status === 504 ||
+          ax?.status === 503 ||
+          ax?.status === 502 ||
+          bodyStr.includes('timed out'));
+      console.error(
+        `${label} failed (attempt ${attempt}/${maxAttempts}):`,
+        ax ? { status: ax.status, data: ax.data } : err.code || err.message
+      );
+      if (!retry) throw err;
+      await new Promise(r => setTimeout(r, 450 * attempt));
+    }
+  }
+  throw lastErr;
+}
 
 const PUBLIC_DIR = path.join(__dirname, 'public');
 const AVATAR_FILES = ['avatar.png', 'avatar.jpg', 'avatar.jpeg', 'avatar.webp'];
@@ -39,6 +74,8 @@ const PATREON_PROFILE_URL =
   process.env.PATREON_PROFILE_URL || 'https://www.patreon.com/TGV9173';
 const PIXIV_URL =
   (process.env.PIXIV_URL || 'https://www.pixiv.net/users/50533861').trim();
+const DEVIANTART_URL =
+  (process.env.DEVIANTART_URL || 'https://www.deviantart.com/tgv9173').trim();
 
 function escapeHtmlAttr(value) {
   return String(value)
@@ -62,6 +99,7 @@ app.use(express.static(PUBLIC_DIR));
 app.get('/', (req, res) => {
   const patreonHref = escapeHtmlAttr(PATREON_PROFILE_URL);
   const pixivHref = escapeHtmlAttr(PIXIV_URL);
+  const deviantartHref = escapeHtmlAttr(DEVIANTART_URL);
 
   const avatarSrc = resolveLandingAvatarSrc();
   const avatarMarkup = avatarSrc
@@ -106,6 +144,7 @@ app.get('/', (req, res) => {
     a.icon-btn svg { width: 28px; height: 28px; display: block; }
     a.icon-btn.patreon { background: #FF424D; color: #fff; }
     a.icon-btn.pixiv { background: #0096FA; color: #fff; }
+    a.icon-btn.deviantart { background: #05CC47; color: #fff; }
     a.btn {
       display: block; padding: 0.85rem 1rem; border-radius: 8px; text-decoration: none;
       font-weight: 600; font-size: 1rem; border: 2px solid transparent; transition: background 0.15s, border-color 0.15s;
@@ -132,6 +171,9 @@ app.get('/', (req, res) => {
       </a>
       <a class="icon-btn pixiv" href="${pixivHref}" target="_blank" rel="noopener noreferrer" aria-label="TGV9173 on Pixiv">
         <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M4.935 0A4.924 4.924 0 0 0 0 4.935v14.13A4.924 4.924 0 0 0 4.935 24h14.13A4.924 4.924 0 0 0 24 19.065V4.935A4.924 4.924 0 0 0 19.065 0zm7.81 4.547c2.181 0 4.058.676 5.399 1.847a6.118 6.118 0 0 1 2.116 4.66c.005 1.854-.88 3.476-2.257 4.563-1.375 1.092-3.225 1.697-5.258 1.697-2.314 0-4.46-.842-4.46-.842v2.718c.397.116 1.048.365.635.779H5.79c-.41-.41.19-.65.644-.779V7.666c-1.053.81-1.593 1.51-1.868 2.031.32 1.02-.284.969-.284.969l-1.09-1.73s3.868-4.39 9.553-4.39zm-.19.971c-1.423-.003-3.184.473-4.27 1.244v8.646c.988.487 2.484.832 4.26.832h.01c1.596 0 2.98-.593 3.93-1.533.952-.948 1.486-2.183 1.492-3.683-.005-1.54-.504-2.864-1.42-3.86-.918-.992-2.274-1.645-4.002-1.646Z"/></svg>
+      </a>
+      <a class="icon-btn deviantart" href="${deviantartHref}" target="_blank" rel="noopener noreferrer" aria-label="TGV9173 on DeviantArt">
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M19.207 4.794l.23-.43V0H15.07l-.436.44-2.058 3.925-.646.436H4.58v5.993h4.04l.36.436-4.175 7.98-.24.43V24H8.93l.436-.44 2.07-3.925.644-.436h7.35v-5.993h-4.05l-.36-.438 4.186-7.977z"/></svg>
       </a>
     </div>
   </main>
@@ -198,26 +240,30 @@ app.get('/callback', async (req, res) => {
   }
 
   try {
-    const tokenRes = await axios.post(
-      'https://www.patreon.com/api/oauth2/token',
-      querystring.stringify({
-        code,
-        grant_type: 'authorization_code',
-        client_id: CLIENT_ID,
-        client_secret: CLIENT_SECRET,
-        redirect_uri: REDIRECT_URI
-      }),
-      {
-        headers: {
-          'Content-Type': 'application/x-www-form-urlencoded',
-          'User-Agent': PATREON_API_USER_AGENT
+    const tokenRes = await patreonRequest('Patreon token exchange', () =>
+      axios.post(
+        'https://www.patreon.com/api/oauth2/token',
+        querystring.stringify({
+          code,
+          grant_type: 'authorization_code',
+          client_id: CLIENT_ID,
+          client_secret: CLIENT_SECRET,
+          redirect_uri: REDIRECT_URI
+        }),
+        {
+          timeout: PATREON_HTTP_TIMEOUT_MS,
+          headers: {
+            'Content-Type': 'application/x-www-form-urlencoded',
+            'User-Agent': PATREON_API_USER_AGENT
+          }
         }
-      }
+      )
     );
 
     const accessToken = tokenRes.data.access_token;
 
-    // Patreon API v2: every resource needs explicit fields[...] or responses omit attributes/relationships.
+    // Patreon API v2: every resource needs explicit fields[...]. (Do not add memberships.campaign here
+    // without the "campaigns" OAuth scope — it can 400. Member resources still include campaign id in relationships.)
     const identityQuery = querystring.stringify({
       include: 'memberships,memberships.currently_entitled_tiers',
       'fields[user]': 'full_name,image_url,url,vanity',
@@ -226,15 +272,15 @@ app.get('/callback', async (req, res) => {
       'fields[tier]': 'title,amount_cents'
     });
 
-    const userRes = await axios.get(
-      `https://www.patreon.com/api/oauth2/v2/identity?${identityQuery}`,
-      {
+    const userRes = await patreonRequest('Patreon identity', () =>
+      axios.get(`https://www.patreon.com/api/oauth2/v2/identity?${identityQuery}`, {
+        timeout: PATREON_HTTP_TIMEOUT_MS,
         headers: {
           Authorization: `Bearer ${accessToken}`,
           Accept: 'application/vnd.api+json',
           'User-Agent': PATREON_API_USER_AGENT
         }
-      }
+      })
     );
 
     const allowedTierIds = (process.env.ALLOWED_TIER_IDS || '')
@@ -243,11 +289,22 @@ app.get('/callback', async (req, res) => {
       .filter(id => id);
 
     const memberships = userRes.data.included || [];
-    const userTierIds = memberships
-      .filter(item => item.type === 'member')
-      .flatMap(item =>
-        (item.relationships?.currently_entitled_tiers?.data || []).map(tier => tier.id)
+    let memberItems = memberships.filter(item => item.type === 'member');
+    if (PATREON_CAMPAIGN_ID) {
+      memberItems = memberItems.filter(
+        m => m.relationships?.campaign?.data?.id === PATREON_CAMPAIGN_ID
       );
+      if (memberItems.length === 0) {
+        console.error(
+          'Tier check: no member row for PATREON_CAMPAIGN_ID',
+          PATREON_CAMPAIGN_ID,
+          '(wrong ID or patron not in this campaign)'
+        );
+      }
+    }
+    const userTierIds = memberItems.flatMap(item =>
+      (item.relationships?.currently_entitled_tiers?.data || []).map(tier => tier.id)
+    );
 
     const matched = userTierIds.some(id => allowedTierIds.includes(id));
 
@@ -274,12 +331,23 @@ app.get('/callback', async (req, res) => {
 
   } catch (err) {
     const ax = err.response;
+    const data = ax?.data;
+    const oauthErr = typeof data === 'object' && data && data.error;
+
     console.error(
       'OAuth error:',
-      ax ? { status: ax.status, data: ax.data } : err.message || err
+      ax ? { status: ax.status, data } : err.code || err.message || err
     );
     console.error('Referer from /login on OAuth failure:', loginReferer);
     res.clearCookie('login_referer', loginRefererCookieOptions());
+
+    if (oauthErr === 'invalid_grant') {
+      return res.status(400).send(
+        'This login link expired or was already used (do not refresh the Patreon return page). ' +
+          'Go back to the site home and click “Login and get folder link” once.'
+      );
+    }
+
     res.status(500).send('⚠️ An error occurred during authentication.');
   }
 });
