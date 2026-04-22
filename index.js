@@ -15,6 +15,12 @@ const REDIRECT_URI = process.env.REDIRECT_URI || 'https://patreon-checker.onrend
 const ALLOWED_TIER_IDS = process.env.ALLOWED_TIER_IDS;
 const SUCCESS_REDIRECT_URI = process.env.SUCCESS_REDIRECT_URI;
 
+// Patreon's edge/WAF commonly rejects requests without a descriptive User-Agent (400 with empty body).
+// Override via Render env if needed. https://www.patreondevelopers.com/t/status-400-https-www-patreon-com-api-oauth2-v2-identity/8836
+const PATREON_API_USER_AGENT =
+  process.env.PATREON_API_USER_AGENT ||
+  'TGV9173-patreon-checker/1.0 (+https://patreon-checker.onrender.com)';
+
 const PUBLIC_DIR = path.join(__dirname, 'public');
 const AVATAR_FILES = ['avatar.png', 'avatar.jpg', 'avatar.jpeg', 'avatar.webp'];
 
@@ -202,7 +208,10 @@ app.get('/callback', async (req, res) => {
         redirect_uri: REDIRECT_URI
       }),
       {
-        headers: { 'Content-Type': 'application/x-www-form-urlencoded' }
+        headers: {
+          'Content-Type': 'application/x-www-form-urlencoded',
+          'User-Agent': PATREON_API_USER_AGENT
+        }
       }
     );
 
@@ -222,7 +231,8 @@ app.get('/callback', async (req, res) => {
       {
         headers: {
           Authorization: `Bearer ${accessToken}`,
-          Accept: 'application/vnd.api+json'
+          Accept: 'application/vnd.api+json',
+          'User-Agent': PATREON_API_USER_AGENT
         }
       }
     );
@@ -263,7 +273,11 @@ app.get('/callback', async (req, res) => {
     }
 
   } catch (err) {
-    console.error('OAuth error:', err.response ? err.response.data : err);
+    const ax = err.response;
+    console.error(
+      'OAuth error:',
+      ax ? { status: ax.status, data: ax.data } : err.message || err
+    );
     console.error('Referer from /login on OAuth failure:', loginReferer);
     res.clearCookie('login_referer', loginRefererCookieOptions());
     res.status(500).send('⚠️ An error occurred during authentication.');
