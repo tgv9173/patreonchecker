@@ -5,6 +5,8 @@ const cookieParser = require('cookie-parser');
 const path = require('path');
 const fs = require('fs');
 
+const { track, TRACK_HOME } = require('./analytics');
+
 const app = express();
 app.set('trust proxy', 1);
 
@@ -97,6 +99,8 @@ app.use(cookieParser());
 app.use(express.static(PUBLIC_DIR));
 
 app.get('/', (req, res) => {
+  if (TRACK_HOME) track('page_home');
+
   const patreonHref = escapeHtmlAttr(PATREON_PROFILE_URL);
   const pixivHref = escapeHtmlAttr(PIXIV_URL);
   const deviantartHref = escapeHtmlAttr(DEVIANTART_URL);
@@ -182,6 +186,7 @@ app.get('/', (req, res) => {
 });
 
 app.get('/commissions', (req, res) => {
+  track('page_commissions_wip');
   res.send(`<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -211,6 +216,7 @@ app.get('/commissions', (req, res) => {
 
 app.get('/login', (req, res) => {
   const referer = req.get('Referer') || 'No referer';
+  track('login_started', { referer: referer === 'No referer' ? undefined : referer.slice(0, 500) });
   res.cookie('login_referer', referer, loginRefererCookieOptions());
   const params = querystring.stringify({
     response_type: 'code',
@@ -226,20 +232,31 @@ app.get('/callback', async (req, res) => {
   const oauthDescription = req.query.error_description;
   const code = req.query.code;
   const loginReferer = req.cookies.login_referer || 'No referer';
+  // #region agent log
+  fetch('http://127.0.0.1:7507/ingest/90928947-0179-4950-be7f-39bc788ff31f',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'a59a9b'},body:JSON.stringify({sessionId:'a59a9b',runId:'repro-1',hypothesisId:'H1',location:'index.js:/callback:entry',message:'Callback entered',data:{hasCode:Boolean(code),hasOauthError:Boolean(oauthError),refererKnown:loginReferer!=='No referer'},timestamp:Date.now()})}).catch(()=>{});
+  // #endregion
 
   if (oauthError) {
     console.error('OAuth denied or error:', oauthError, oauthDescription || '');
+    track('oauth_patron_cancelled_or_error', {
+      oauthError,
+      oauthDescription: oauthDescription ? oauthDescription.slice(0, 300) : undefined
+    });
     res.clearCookie('login_referer', loginRefererCookieOptions());
     return res.status(400).send(
       `Login was not completed (${oauthError}). Please try again from your creator's link.`
     );
   }
   if (!code) {
+    track('oauth_missing_code');
     res.clearCookie('login_referer', loginRefererCookieOptions());
     return res.status(400).send('Missing authorization code. Please start login again.');
   }
 
   try {
+    // #region agent log
+    fetch('http://127.0.0.1:7507/ingest/90928947-0179-4950-be7f-39bc788ff31f',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'a59a9b'},body:JSON.stringify({sessionId:'a59a9b',runId:'repro-1',hypothesisId:'H2',location:'index.js:/callback:beforeToken',message:'About to exchange auth code',data:{timeoutMs:PATREON_HTTP_TIMEOUT_MS,userAgentSet:Boolean(PATREON_API_USER_AGENT)},timestamp:Date.now()})}).catch(()=>{});
+    // #endregion
     const tokenRes = await patreonRequest('Patreon token exchange', () =>
       axios.post(
         'https://www.patreon.com/api/oauth2/token',
@@ -261,6 +278,9 @@ app.get('/callback', async (req, res) => {
     );
 
     const accessToken = tokenRes.data.access_token;
+    // #region agent log
+    fetch('http://127.0.0.1:7507/ingest/90928947-0179-4950-be7f-39bc788ff31f',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'a59a9b'},body:JSON.stringify({sessionId:'a59a9b',runId:'repro-1',hypothesisId:'H2',location:'index.js:/callback:tokenOk',message:'Token exchange succeeded',data:{hasAccessToken:Boolean(accessToken)},timestamp:Date.now()})}).catch(()=>{});
+    // #endregion
 
     // Patreon API v2: every resource needs explicit fields[...]. (Do not add memberships.campaign here
     // without the "campaigns" OAuth scope — it can 400. Member resources still include campaign id in relationships.)
@@ -308,12 +328,19 @@ app.get('/callback', async (req, res) => {
 
     const matched = userTierIds.some(id => allowedTierIds.includes(id));
 
+    const patreonUserId = userRes.data?.data?.id;
+    // #region agent log
+    fetch('http://127.0.0.1:7507/ingest/90928947-0179-4950-be7f-39bc788ff31f',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'a59a9b'},body:JSON.stringify({sessionId:'a59a9b',runId:'repro-1',hypothesisId:'H4',location:'index.js:/callback:identityDone',message:'Identity and tier check completed',data:{matched,entitledTierCount:userTierIds.length,allowedTierCount:allowedTierIds.length,campaignFilterActive:Boolean(PATREON_CAMPAIGN_ID)},timestamp:Date.now()})}).catch(()=>{});
+    // #endregion
+
     if (matched) {
       if (!SUCCESS_REDIRECT_URI) {
         console.error('SUCCESS_REDIRECT_URI is not set');
+        track('oauth_server_misconfigured', { missingEnv: 'SUCCESS_REDIRECT_URI' });
         res.clearCookie('login_referer', loginRefererCookieOptions());
         return res.status(500).send('Server configuration error: missing success redirect.');
       }
+      track('oauth_success', { patreonUserId });
       res.clearCookie('login_referer', loginRefererCookieOptions());
       res.redirect(SUCCESS_REDIRECT_URI);
     } else {
@@ -324,6 +351,11 @@ app.get('/callback', async (req, res) => {
         allowedTierIds
       );
       console.error('Referer from /login on access denial:', loginReferer);
+      track('oauth_tier_denied', {
+        patreonUserId,
+        entitledTierCount: userTierIds.length,
+        campaignFilterActive: Boolean(PATREON_CAMPAIGN_ID)
+      });
       res.clearCookie('login_referer', loginRefererCookieOptions());
       res.status(403).send('❌ Access denied: You are not subscribed to the required tier.');
       return;
@@ -333,6 +365,9 @@ app.get('/callback', async (req, res) => {
     const ax = err.response;
     const data = ax?.data;
     const oauthErr = typeof data === 'object' && data && data.error;
+    // #region agent log
+    fetch('http://127.0.0.1:7507/ingest/90928947-0179-4950-be7f-39bc788ff31f',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'a59a9b'},body:JSON.stringify({sessionId:'a59a9b',runId:'repro-1',hypothesisId:'H3',location:'index.js:/callback:catch',message:'Callback failed in catch',data:{httpStatus:ax?.status||null,oauthErr:oauthErr||null,networkCode:err.code||null,isTimeout:String(ax?.data||'').includes('timed out')},timestamp:Date.now()})}).catch(()=>{});
+    // #endregion
 
     console.error(
       'OAuth error:',
@@ -342,12 +377,18 @@ app.get('/callback', async (req, res) => {
     res.clearCookie('login_referer', loginRefererCookieOptions());
 
     if (oauthErr === 'invalid_grant') {
+      track('oauth_invalid_grant');
       return res.status(400).send(
         'This login link expired or was already used (do not refresh the Patreon return page). ' +
           'Go back to the site home and click “Login and get folder link” once.'
       );
     }
 
+    track('oauth_request_failed', {
+      httpStatus: ax?.status,
+      patreonOAuthError: oauthErr || undefined,
+      networkCode: err.code || undefined
+    });
     res.status(500).send('⚠️ An error occurred during authentication.');
   }
 });
