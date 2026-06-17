@@ -231,13 +231,13 @@ app.get('/login', (req, res) => {
 
 function errorPage({ status, title, body, retryHref }) {
   const retryMarkup = retryHref
-    ? `<a class=”btn btn-primary” href=”${escapeHtmlAttr(retryHref)}”>Try again</a>`
+    ? `<a class="btn btn-primary" href="${escapeHtmlAttr(retryHref)}">Try again</a>`
     : '';
   return `<!DOCTYPE html>
-<html lang=”en”>
+<html lang="en">
 <head>
-  <meta charset=”utf-8”>
-  <meta name=”viewport” content=”width=device-width, initial-scale=1”>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>${escapeHtmlAttr(title)}</title>
   <style>
     :root { font-family: system-ui, sans-serif; line-height: 1.5; color: #1a1a1a; }
@@ -259,7 +259,7 @@ function errorPage({ status, title, body, retryHref }) {
   <main>
     <h1>${escapeHtmlAttr(title)}</h1>
     <p>${body}</p>
-    <div class=”actions”>
+    <div class="actions">
       ${retryMarkup}
       <a class="btn btn-secondary" href="/">Back to home</a>
     </div>
@@ -325,7 +325,7 @@ app.get('/callback', async (req, res) => {
     const accessToken = tokenRes.data.access_token;
 
     // Patreon API v2: every resource needs explicit fields[...]. (Do not add memberships.campaign here
-    // without the “campaigns” OAuth scope — it can 400. Member resources still include campaign id in relationships.)
+    // without the "campaigns" OAuth scope — it can 400. Member resources still include campaign id in relationships.)
     const identityQuery = querystring.stringify({
       include: 'memberships,memberships.currently_entitled_tiers',
       'fields[user]': 'full_name,image_url,url,vanity',
