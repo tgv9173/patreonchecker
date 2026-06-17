@@ -261,7 +261,7 @@ function errorPage({ status, title, body, retryHref }) {
     <p>${body}</p>
     <div class=”actions”>
       ${retryMarkup}
-      <a class=”btn btn-secondary” href=”/”>Back to home</a>
+      <a class="btn btn-secondary" href="/">Back to home</a>
     </div>
   </main>
 </body>
