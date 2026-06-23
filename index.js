@@ -2,6 +2,7 @@ const express = require('express');
 const axios = require('axios');
 const querystring = require('querystring');
 const cookieParser = require('cookie-parser');
+const crypto = require('crypto');
 const path = require('path');
 const fs = require('fs');
 
@@ -219,12 +220,15 @@ app.get('/commissions', (req, res) => {
 app.get('/login', (req, res) => {
   const referer = req.get('Referer') || 'No referer';
   track('login_started', { referer: referer === 'No referer' ? undefined : referer.slice(0, 500) });
+  const state = crypto.randomBytes(16).toString('hex');
   res.cookie('login_referer', referer, loginRefererCookieOptions());
+  res.cookie('oauth_state', state, loginRefererCookieOptions());
   const params = querystring.stringify({
     response_type: 'code',
     client_id: CLIENT_ID,
     redirect_uri: REDIRECT_URI,
-    scope: 'identity identity.memberships'
+    scope: 'identity identity.memberships',
+    state
   });
   res.redirect(`https://www.patreon.com/oauth2/authorize?${params}`);
 });
@@ -272,7 +276,9 @@ app.get('/callback', async (req, res) => {
   const oauthError = req.query.error;
   const oauthDescription = req.query.error_description;
   const code = req.query.code;
+  const returnedState = req.query.state;
   const loginReferer = req.cookies.login_referer || 'No referer';
+  const expectedState = req.cookies.oauth_state;
 
   if (oauthError) {
     console.error('OAuth denied or error:', oauthError, oauthDescription || '');
@@ -281,6 +287,7 @@ app.get('/callback', async (req, res) => {
       oauthDescription: oauthDescription ? oauthDescription.slice(0, 300) : undefined
     });
     res.clearCookie('login_referer', loginRefererCookieOptions());
+    res.clearCookie('oauth_state', loginRefererCookieOptions());
     return res.status(400).send(
       errorPage({
         title: 'Login cancelled',
@@ -289,6 +296,21 @@ app.get('/callback', async (req, res) => {
       })
     );
   }
+
+  if (!returnedState || !expectedState || returnedState !== expectedState) {
+    track('oauth_state_mismatch');
+    res.clearCookie('login_referer', loginRefererCookieOptions());
+    res.clearCookie('oauth_state', loginRefererCookieOptions());
+    return res.status(400).send(
+      errorPage({
+        title: 'Session expired',
+        body: 'Your login session has expired or was opened in a different browser tab. Please start the login flow again.',
+        retryHref: '/login'
+      })
+    );
+  }
+  res.clearCookie('oauth_state', loginRefererCookieOptions());
+
   if (!code) {
     track('oauth_missing_code');
     res.clearCookie('login_referer', loginRefererCookieOptions());
