@@ -27,6 +27,41 @@ const PATREON_API_USER_AGENT =
 const PATREON_CAMPAIGN_ID = (process.env.PATREON_CAMPAIGN_ID || '').trim();
 const PATREON_HTTP_TIMEOUT_MS = Number(process.env.PATREON_HTTP_TIMEOUT_MS || 45000);
 
+const AUTH_CACHE_TTL_MS = 60 * 60 * 1000; // 1 hour
+const SESSION_SECRET = crypto.randomBytes(32); // rotates on restart — cache cookies become invalid, users re-authenticate
+const patronCache = new Map(); // patreonUserId → { matched, expires }
+
+function patronCookieSign(userId) {
+  const expires = Date.now() + AUTH_CACHE_TTL_MS;
+  const payload = `${userId}|${expires}`;
+  const sig = crypto.createHmac('sha256', SESSION_SECRET).update(payload).digest('base64url');
+  return `${payload}.${sig}`;
+}
+
+function patronCookieVerify(value) {
+  if (typeof value !== 'string') return null;
+  const dot = value.lastIndexOf('.');
+  if (dot < 0) return null;
+  const payload = value.slice(0, dot);
+  const sig = value.slice(dot + 1);
+  const expected = crypto.createHmac('sha256', SESSION_SECRET).update(payload).digest('base64url');
+  try {
+    if (!crypto.timingSafeEqual(Buffer.from(sig, 'base64url'), Buffer.from(expected, 'base64url'))) return null;
+  } catch { return null; }
+  const [userId, expiresStr] = payload.split('|');
+  if (!userId || Date.now() > Number(expiresStr)) return null;
+  return userId;
+}
+
+function getCachedPatron(userId) {
+  const entry = patronCache.get(userId);
+  if (!entry || Date.now() > entry.expires) {
+    patronCache.delete(userId);
+    return null;
+  }
+  return entry;
+}
+
 /** Retries Patreon HTTP calls on timeouts / 502–504 (common when their edge is slow). */
 async function patreonRequest(label, axiosCall) {
   const maxAttempts = 3;
@@ -346,14 +381,42 @@ app.get('/callback', async (req, res) => {
 
     const accessToken = tokenRes.data.access_token;
 
-    // Patreon API v2: every resource needs explicit fields[...]. (Do not add memberships.campaign here
-    // without the "campaigns" OAuth scope — it can 400. Member resources still include campaign id in relationships.)
+    // Check HMAC-signed cache cookie — lets returning users bypass the identity API call
+    // (token exchange above already proved Patreon authorized them; we're only caching the tier result)
+    const cachedUserId = patronCookieVerify(req.cookies.patron_verified);
+    if (cachedUserId) {
+      const cached = getCachedPatron(cachedUserId);
+      if (cached) {
+        res.clearCookie('login_referer', loginRefererCookieOptions());
+        if (cached.matched) {
+          if (!SUCCESS_REDIRECT_URI) {
+            track('oauth_server_misconfigured', { missingEnv: 'SUCCESS_REDIRECT_URI' });
+            return res.status(500).send(
+              errorPage({ title: 'Server configuration error', body: 'Missing success redirect. Please contact the creator.' })
+            );
+          }
+          track('oauth_success', { patreonUserId: cachedUserId, cached: true });
+          return res.redirect(SUCCESS_REDIRECT_URI);
+        } else {
+          track('oauth_tier_denied', { patreonUserId: cachedUserId, cached: true });
+          return res.status(403).send(
+            errorPage({
+              title: 'Access denied',
+              body: 'Your Patreon account is not subscribed to a required tier. If you believe this is a mistake, make sure your payment is up to date on Patreon and try again.',
+              retryHref: '/login'
+            })
+          );
+        }
+      }
+    }
+
+    // Patreon API v2: only request relationship IDs — attributes on member/tier are unused.
+    // (Do not add memberships.campaign without the "campaigns" scope — it can 400.)
     const identityQuery = querystring.stringify({
       include: 'memberships,memberships.currently_entitled_tiers',
-      'fields[user]': 'full_name,image_url,url,vanity',
-      'fields[member]':
-        'patron_status,currently_entitled_amount_cents,last_charge_status,last_charge_date,pledge_relationship_start',
-      'fields[tier]': 'title,amount_cents'
+      'fields[user]': 'full_name',
+      'fields[member]': 'patron_status',
+      'fields[tier]': 'title'
     });
 
     const userRes = await patreonRequest('Patreon identity', () =>
@@ -391,8 +454,18 @@ app.get('/callback', async (req, res) => {
     );
 
     const matched = userTierIds.some(id => allowedTierIds.includes(id));
-
     const patreonUserId = userRes.data?.data?.id;
+
+    // Cache the result and set signed cookie for future logins within 1 hour
+    if (patreonUserId) {
+      patronCache.set(patreonUserId, { matched, expires: Date.now() + AUTH_CACHE_TTL_MS });
+      res.cookie('patron_verified', patronCookieSign(patreonUserId), {
+        httpOnly: true,
+        sameSite: 'lax',
+        secure: process.env.NODE_ENV === 'production',
+        maxAge: AUTH_CACHE_TTL_MS
+      });
+    }
 
     if (matched) {
       if (!SUCCESS_REDIRECT_URI) {
