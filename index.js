@@ -5,11 +5,39 @@ const cookieParser = require('cookie-parser');
 const crypto = require('crypto');
 const path = require('path');
 const fs = require('fs');
+const multer = require('multer');
 
 const { track, TRACK_HOME } = require('./analytics');
+const {
+  findCommissionsForPatron,
+  findCommissionsByUsername,
+  getFreshCommissionRow,
+  updateCommissionRow,
+  flagRowChangesRequested
+} = require('./sheets');
 
 const app = express();
 app.set('trust proxy', 1);
+
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 8 * 1024 * 1024, files: 1 },
+  fileFilter: (req, file, cb) => {
+    cb(null, /^image\/(png|jpe?g|gif|webp)$/i.test(file.mimetype));
+  }
+});
+
+async function uploadToCatbox(file) {
+  const form = new FormData();
+  form.append('reqtype', 'fileupload');
+  form.append('fileToUpload', new Blob([file.buffer], { type: file.mimetype }), file.originalname || 'upload.jpg');
+  const res = await fetch('https://catbox.moe/user/api.php', { method: 'POST', body: form });
+  const text = (await res.text()).trim();
+  if (!res.ok || !/^https?:\/\//.test(text)) {
+    throw new Error(`catbox upload failed: ${res.status} ${text.slice(0, 200)}`);
+  }
+  return text;
+}
 
 const CLIENT_ID = process.env.CLIENT_ID;
 const CLIENT_SECRET = process.env.CLIENT_SECRET;
@@ -51,6 +79,82 @@ function patronCookieVerify(value) {
   const [userId, expiresStr] = payload.split('|');
   if (!userId || Date.now() > Number(expiresStr)) return null;
   return userId;
+}
+
+const IDENTITY_COOKIE_TTL_MS = 24 * 60 * 60 * 1000; // 24h — re-login to refresh
+
+function identityCookieSign(fullName) {
+  const expires = Date.now() + IDENTITY_COOKIE_TTL_MS;
+  const payload = `${Buffer.from(fullName, 'utf8').toString('base64url')}|${expires}`;
+  const sig = crypto.createHmac('sha256', SESSION_SECRET).update(payload).digest('base64url');
+  return `${payload}.${sig}`;
+}
+
+function identityCookieVerify(value) {
+  if (typeof value !== 'string') return null;
+  const dot = value.lastIndexOf('.');
+  if (dot < 0) return null;
+  const payload = value.slice(0, dot);
+  const sig = value.slice(dot + 1);
+  const expected = crypto.createHmac('sha256', SESSION_SECRET).update(payload).digest('base64url');
+  try {
+    if (!crypto.timingSafeEqual(Buffer.from(sig, 'base64url'), Buffer.from(expected, 'base64url'))) return null;
+  } catch { return null; }
+  const [nameB64, expiresStr] = payload.split('|');
+  if (!nameB64 || Date.now() > Number(expiresStr)) return null;
+  try {
+    return Buffer.from(nameB64, 'base64url').toString('utf8');
+  } catch {
+    return null;
+  }
+}
+
+const EDIT_TOKEN_TTL_MS = 15 * 60 * 1000; // 15 minutes — plenty for filling out the edit form
+
+// Ties an edit link to the exact row + the username it was matched under, so a leaked/guessed
+// URL can't be used to edit someone else's row — the row's own username must still match on submit.
+function editTokenSign({ month, rowNumber, username }) {
+  const expires = Date.now() + EDIT_TOKEN_TTL_MS;
+  const payload = [
+    Buffer.from(month, 'utf8').toString('base64url'),
+    rowNumber,
+    Buffer.from(username, 'utf8').toString('base64url'),
+    expires
+  ].join('|');
+  const sig = crypto.createHmac('sha256', SESSION_SECRET).update(payload).digest('base64url');
+  return `${payload}.${sig}`;
+}
+
+function editTokenVerify(value) {
+  if (typeof value !== 'string') return null;
+  const dot = value.lastIndexOf('.');
+  if (dot < 0) return null;
+  const payload = value.slice(0, dot);
+  const sig = value.slice(dot + 1);
+  const expected = crypto.createHmac('sha256', SESSION_SECRET).update(payload).digest('base64url');
+  try {
+    if (!crypto.timingSafeEqual(Buffer.from(sig, 'base64url'), Buffer.from(expected, 'base64url'))) return null;
+  } catch { return null; }
+  const [monthB64, rowNumberStr, usernameB64, expiresStr] = payload.split('|');
+  if (!monthB64 || !usernameB64 || Date.now() > Number(expiresStr)) return null;
+  try {
+    return {
+      month: Buffer.from(monthB64, 'base64url').toString('utf8'),
+      rowNumber: Number(rowNumberStr),
+      username: Buffer.from(usernameB64, 'base64url').toString('utf8')
+    };
+  } catch {
+    return null;
+  }
+}
+
+function identityCookieOptions() {
+  return {
+    httpOnly: true,
+    sameSite: 'lax',
+    secure: process.env.NODE_ENV === 'production',
+    maxAge: IDENTITY_COOKIE_TTL_MS
+  };
 }
 
 function getCachedPatron(userId) {
@@ -223,39 +327,318 @@ app.get('/', (req, res) => {
 </html>`);
 });
 
-app.get('/commissions', (req, res) => {
-  track('page_commissions_wip');
-  res.send(`<!DOCTYPE html>
+function commissionsPageShell({ title, bodyHtml, maxWidth = '26rem' }) {
+  return `<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Commission tracking</title>
+  <title>${escapeHtmlAttr(title)}</title>
   <style>
     :root { font-family: system-ui, sans-serif; line-height: 1.5; color: #1a1a1a; }
     body { margin: 0; min-height: 100vh; display: flex; flex-direction: column; align-items: center;
       justify-content: center; padding: 1.5rem; background: #f6f7f9; box-sizing: border-box; }
-    main { width: 100%; max-width: 24rem; text-align: center; }
+    main { width: 100%; max-width: ${maxWidth}; text-align: center; }
     h1 { font-size: 1.25rem; font-weight: 650; margin: 0 0 0.75rem; }
     p { margin: 0 0 1.25rem; color: #444; font-size: 0.95rem; }
     a { color: #2563eb; font-weight: 600; }
     a:focus-visible { outline: 2px solid #2563eb; outline-offset: 2px; border-radius: 4px; }
+    .actions { display: flex; flex-direction: column; gap: 0.75rem; margin-top: 0.5rem; }
+    a.btn { display: block; padding: 0.85rem 1rem; border-radius: 8px; text-decoration: none;
+      font-weight: 600; font-size: 1rem; border: 2px solid transparent; }
+    a.btn-primary { background: #2563eb; color: #fff; }
+    a.btn-primary:hover { background: #1d4ed8; }
+    a.btn-secondary { background: #fff; color: #1a1a1a; border-color: #d1d5db; }
+    a.btn-secondary:hover { background: #f3f4f6; }
+    ul.commission-list { list-style: none; margin: 0 0 1.25rem; padding: 0; text-align: left;
+      display: flex; flex-direction: column; gap: 0.75rem; }
+    li.commission-card { background: #fff; border: 1px solid #e5e7eb; border-radius: 10px; padding: 0.9rem 1rem; }
+    .commission-card .top-row { display: flex; align-items: center; justify-content: space-between; gap: 0.5rem; margin-bottom: 0.35rem; }
+    .commission-card .character { font-weight: 650; font-size: 1rem; }
+    .commission-card .month { font-size: 0.8rem; color: #6b7280; }
+    .commission-card .outfit { font-size: 0.85rem; color: #444; margin: 0; }
+    .status-badge { display: inline-block; padding: 0.2rem 0.6rem; border-radius: 999px;
+      font-size: 0.78rem; font-weight: 650; white-space: nowrap; }
+    .status-not-started { background: #f3f4f6; color: #4b5563; border: 1px solid #d1d5db; }
+    .status-preview-sent { background: #fdead2; color: #92400e; }
+    .status-changes-requested { background: #fecaca; color: #991b1b; }
+    .status-approved { background: #bbf7d0; color: #14532d; }
+    .status-delivered { background: #bfdbfe; color: #1e3a8a; }
+    .status-unknown { background: #f3f4f6; color: #4b5563; }
+    .commission-card .edit-link { font-size: 0.8rem; font-weight: 650; }
+    .manual-search { text-align: left; display: flex; flex-direction: column; gap: 0.4rem; margin: 0 0 1.25rem; }
+    .manual-search label { font-size: 0.85rem; font-weight: 600; color: #333; }
+    .manual-search input[type="text"] { padding: 0.6rem 0.75rem; border-radius: 8px; border: 1px solid #d1d5db; font-size: 0.95rem; }
+    .manual-search-details { text-align: left; margin: 0 0 1.25rem; }
+    .manual-search-details summary { cursor: pointer; font-size: 0.85rem; font-weight: 600; color: #2563eb; margin-bottom: 0.75rem; }
+    .manual-search-details .manual-search { margin-bottom: 0; }
+    .edit-form { text-align: left; display: flex; flex-direction: column; gap: 0.3rem; margin-bottom: 1rem; }
+    .edit-form label { font-size: 0.85rem; font-weight: 600; color: #333; margin-top: 0.5rem; }
+    .edit-form input[type="text"], .edit-form textarea, .edit-form input[type="file"] {
+      padding: 0.6rem 0.75rem; border-radius: 8px; border: 1px solid #d1d5db; font-size: 0.95rem;
+      font-family: inherit; box-sizing: border-box; width: 100%;
+    }
+    .edit-form .actions { margin-top: 0.75rem; }
+    .form-error { background: #fecaca; color: #991b1b; padding: 0.6rem 0.85rem; border-radius: 8px; font-size: 0.85rem; text-align: left; }
   </style>
 </head>
 <body>
   <main>
-    <h1>Commission tracking</h1>
-    <p>This page is still in progress. Check back soon.</p>
-    <p><a href="/">Back to home</a></p>
+    ${bodyHtml}
   </main>
 </body>
-</html>`);
+</html>`;
+}
+
+function statusBadgeClass(status) {
+  const key = String(status || '').toLowerCase();
+  if (key.includes('not started')) return 'status-not-started';
+  if (key.includes('preview')) return 'status-preview-sent';
+  if (key.includes('changes')) return 'status-changes-requested';
+  if (key.includes('approved')) return 'status-approved';
+  if (key.includes('delivered')) return 'status-delivered';
+  return 'status-unknown';
+}
+
+// Fallback search box, shown when the automatic Patreon-name match finds nothing.
+// Stays behind Patreon login (this route already requires the commission_identity cookie) —
+// otherwise anyone could type any username and read someone else's (often NSFW) request details.
+function manualSearchFormHtml(prefillValue = '') {
+  return `
+    <form class="manual-search" method="GET" action="/commissions">
+      <label for="manualUsername">Search by the Patreon username you submitted with</label>
+      <input type="text" id="manualUsername" name="manualUsername" value="${escapeHtmlAttr(prefillValue)}" placeholder="e.g. mrK" required>
+      <button type="submit" class="btn btn-secondary">Search</button>
+    </form>`;
+}
+
+function commissionCardHtml(c) {
+  const editLink = c.editable
+    ? `<a class="edit-link" href="/commissions/edit?token=${encodeURIComponent(editTokenSign({ month: c.month, rowNumber: c.rowNumber, username: c.username }))}">Edit</a>`
+    : '';
+  return `
+      <li class="commission-card">
+        <div class="top-row">
+          <span class="character">${escapeHtmlAttr(c.character || 'Untitled')}</span>
+          <span class="status-badge ${statusBadgeClass(c.status)}">${escapeHtmlAttr(c.status)}</span>
+        </div>
+        <p class="outfit">${escapeHtmlAttr(c.outfit || '')}</p>
+        <div class="top-row">
+          <span class="month">${escapeHtmlAttr(c.month)}</span>
+          ${editLink}
+        </div>
+      </li>`;
+}
+
+app.get('/commissions', async (req, res) => {
+  const fullName = identityCookieVerify(req.cookies.commission_identity);
+
+  if (!fullName) {
+    track('page_commissions_logged_out');
+    return res.send(commissionsPageShell({
+      title: 'Commission tracking',
+      bodyHtml: `
+    <h1>Commission tracking</h1>
+    <p>Log in with Patreon to see the status of your commission(s).</p>
+    <div class="actions">
+      <a class="btn btn-primary" href="/login?intent=commissions">Login to check status</a>
+      <a class="btn btn-secondary" href="/">Back to home</a>
+    </div>`
+    }));
+  }
+
+  const manualUsername = typeof req.query.manualUsername === 'string' ? req.query.manualUsername.trim().slice(0, 200) : '';
+
+  try {
+    const commissions = manualUsername
+      ? await findCommissionsByUsername(manualUsername)
+      : await findCommissionsForPatron(fullName);
+    track('page_commissions_viewed', { found: commissions.length, manualSearch: Boolean(manualUsername) });
+
+    if (commissions.length === 0) {
+      const notFoundBody = manualUsername
+        ? `We couldn't find a commission under the username <strong>${escapeHtmlAttr(manualUsername)}</strong> either.`
+        : `We couldn't find a commission under the Patreon name <strong>${escapeHtmlAttr(fullName)}</strong>.`;
+      return res.send(commissionsPageShell({
+        title: 'Commission tracking',
+        bodyHtml: `
+    <h1>No commission found</h1>
+    <p>${notFoundBody} If you submitted under a different name, try searching for it below, or message the creator directly on Patreon.</p>
+    ${manualSearchFormHtml(manualUsername)}
+    <div class="actions">
+      <a class="btn btn-secondary" href="/">Back to home</a>
+    </div>`
+      }));
+    }
+
+    const listHtml = commissions.map(commissionCardHtml).join('');
+
+    res.send(commissionsPageShell({
+      title: 'Commission tracking',
+      maxWidth: '30rem',
+      bodyHtml: `
+    <h1>Your commissions</h1>
+    <ul class="commission-list">${listHtml}</ul>
+    <details class="manual-search-details">
+      <summary>Not seeing a commission? Search a different username</summary>
+      ${manualSearchFormHtml(manualUsername)}
+    </details>
+    <div class="actions">
+      <a class="btn btn-secondary" href="/">Back to home</a>
+    </div>`
+    }));
+  } catch (err) {
+    console.error('Commission lookup failed:', err.response?.data || err.message || err);
+    track('page_commissions_lookup_failed');
+    res.status(500).send(commissionsPageShell({
+      title: 'Something went wrong',
+      bodyHtml: `
+    <h1>Something went wrong</h1>
+    <p>We couldn't load commission data right now. Please try again in a moment.</p>
+    <div class="actions">
+      <a class="btn btn-primary" href="/commissions">Try again</a>
+      <a class="btn btn-secondary" href="/">Back to home</a>
+    </div>`
+    }));
+  }
+});
+
+function editFormPageHtml({ token, commission, error }) {
+  const errorHtml = error ? `<p class="form-error">${escapeHtmlAttr(error)}</p>` : '';
+  return commissionsPageShell({
+    title: 'Edit commission',
+    maxWidth: '30rem',
+    bodyHtml: `
+    <h1>Edit your commission</h1>
+    <p class="month">${escapeHtmlAttr(commission.month)} — editing will flag this for the creator to re-review.</p>
+    ${errorHtml}
+    <form method="POST" action="/commissions/edit" enctype="multipart/form-data" class="edit-form">
+      <input type="hidden" name="token" value="${escapeHtmlAttr(token)}">
+      <label for="character">Character</label>
+      <input type="text" id="character" name="character" value="${escapeHtmlAttr(commission.character)}" required>
+      <label for="outfit">Outfit</label>
+      <textarea id="outfit" name="outfit" rows="3">${escapeHtmlAttr(commission.outfit)}</textarea>
+      <label for="maleType">Male character preference</label>
+      <input type="text" id="maleType" name="maleType" value="${escapeHtmlAttr(commission.maleType)}">
+      <label for="size">Size preference</label>
+      <input type="text" id="size" name="size" value="${escapeHtmlAttr(commission.size)}">
+      <label for="notes">Other requests</label>
+      <textarea id="notes" name="notes" rows="4">${escapeHtmlAttr(commission.notes)}</textarea>
+      <label for="image">Add a reference image (optional)</label>
+      <input type="file" id="image" name="image" accept="image/png,image/jpeg,image/gif,image/webp">
+      <div class="actions">
+        <button type="submit" class="btn btn-primary">Save changes</button>
+        <a class="btn btn-secondary" href="/commissions">Cancel</a>
+      </div>
+    </form>`
+  });
+}
+
+app.get('/commissions/edit', async (req, res) => {
+  const fullName = identityCookieVerify(req.cookies.commission_identity);
+  if (!fullName) return res.redirect('/commissions');
+
+  const decoded = editTokenVerify(req.query.token);
+  if (!decoded) {
+    return res.status(400).send(commissionsPageShell({
+      title: 'Edit link expired',
+      bodyHtml: `
+    <h1>Edit link expired</h1>
+    <p>This edit link is invalid or has expired. Go back and click Edit again.</p>
+    <div class="actions"><a class="btn btn-secondary" href="/commissions">Back to commissions</a></div>`
+    }));
+  }
+
+  const fresh = await getFreshCommissionRow(decoded.month, decoded.rowNumber);
+  if (!fresh || fresh.username !== decoded.username || !fresh.editable) {
+    return res.status(403).send(commissionsPageShell({
+      title: "Can't edit this commission",
+      bodyHtml: `
+    <h1>Can't edit this commission</h1>
+    <p>This commission is no longer editable (its status may have changed). Refresh your commission list to see the current status.</p>
+    <div class="actions"><a class="btn btn-secondary" href="/commissions">Back to commissions</a></div>`
+    }));
+  }
+
+  track('commission_edit_opened');
+  res.send(editFormPageHtml({ token: req.query.token, commission: fresh }));
+});
+
+app.post('/commissions/edit', upload.single('image'), async (req, res) => {
+  const fullName = identityCookieVerify(req.cookies.commission_identity);
+  if (!fullName) return res.redirect('/commissions');
+
+  const decoded = editTokenVerify(req.body.token);
+  if (!decoded) {
+    return res.status(400).send(commissionsPageShell({
+      title: 'Edit link expired',
+      bodyHtml: `
+    <h1>Edit link expired</h1>
+    <p>This edit link is invalid or has expired. Go back and click Edit again.</p>
+    <div class="actions"><a class="btn btn-secondary" href="/commissions">Back to commissions</a></div>`
+    }));
+  }
+
+  const fresh = await getFreshCommissionRow(decoded.month, decoded.rowNumber);
+  if (!fresh || fresh.username !== decoded.username || !fresh.editable) {
+    return res.status(403).send(commissionsPageShell({
+      title: "Can't edit this commission",
+      bodyHtml: `
+    <h1>Can't edit this commission</h1>
+    <p>This commission is no longer editable (its status may have changed). Refresh your commission list to see the current status.</p>
+    <div class="actions"><a class="btn btn-secondary" href="/commissions">Back to commissions</a></div>`
+    }));
+  }
+
+  const character = String(req.body.character || '').trim().slice(0, 2000);
+  const outfit = String(req.body.outfit || '').trim().slice(0, 5000);
+  const maleType = String(req.body.maleType || '').trim().slice(0, 2000);
+  const size = String(req.body.size || '').trim().slice(0, 2000);
+  let notes = String(req.body.notes || '').trim().slice(0, 5000);
+
+  if (!character) {
+    return res.status(400).send(editFormPageHtml({
+      token: req.body.token,
+      commission: { ...fresh, character, outfit, maleType, size, notes },
+      error: 'Character is required.'
+    }));
+  }
+
+  try {
+    if (req.file) {
+      const imageUrl = await uploadToCatbox(req.file);
+      notes = notes ? `${notes}\n[Added reference image: ${imageUrl}]` : `[Added reference image: ${imageUrl}]`;
+    }
+
+    await updateCommissionRow(decoded.month, decoded.rowNumber, { character, outfit, maleType, size, notes });
+    await flagRowChangesRequested(fresh.tabGid, decoded.rowNumber);
+
+    track('commission_edit_saved', { withImage: Boolean(req.file) });
+    res.send(commissionsPageShell({
+      title: 'Commission updated',
+      bodyHtml: `
+    <h1>Changes saved</h1>
+    <p>Your commission has been updated and flagged for the creator to review.</p>
+    <div class="actions"><a class="btn btn-primary" href="/commissions">Back to commissions</a></div>`
+    }));
+  } catch (err) {
+    console.error('Commission edit failed:', err.response?.data || err.message || err);
+    track('commission_edit_failed');
+    res.status(500).send(editFormPageHtml({
+      token: req.body.token,
+      commission: { ...fresh, character, outfit, maleType, size, notes },
+      error: 'Something went wrong saving your changes. Please try again.'
+    }));
+  }
 });
 
 app.get('/login', (req, res) => {
   const referer = req.get('Referer') || 'No referer';
-  track('login_started', { referer: referer === 'No referer' ? undefined : referer.slice(0, 500) });
-  const state = crypto.randomBytes(16).toString('hex');
+  const intent = req.query.intent === 'commissions' ? 'commissions' : 'default';
+  track('login_started', { referer: referer === 'No referer' ? undefined : referer.slice(0, 500), intent });
+  // Intent travels round-trip inside the CSRF state itself (verified exact-match on return) —
+  // no extra cookie needed to remember why the user logged in.
+  const state = `${crypto.randomBytes(16).toString('hex')}.${intent}`;
   res.cookie('login_referer', referer, loginRefererCookieOptions());
   res.cookie('oauth_state', state, loginRefererCookieOptions());
   const params = querystring.stringify({
@@ -345,6 +728,7 @@ app.get('/callback', async (req, res) => {
     );
   }
   res.clearCookie('oauth_state', loginRefererCookieOptions());
+  const intent = returnedState.split('.')[1] === 'commissions' ? 'commissions' : 'default';
 
   if (!code) {
     track('oauth_missing_code');
@@ -383,7 +767,8 @@ app.get('/callback', async (req, res) => {
 
     // Check HMAC-signed cache cookie — lets returning users bypass the identity API call
     // (token exchange above already proved Patreon authorized them; we're only caching the tier result)
-    const cachedUserId = patronCookieVerify(req.cookies.patron_verified);
+    // Skipped for the commissions intent: that flow needs full_name regardless of the cached tier result.
+    const cachedUserId = intent === 'default' ? patronCookieVerify(req.cookies.patron_verified) : null;
     if (cachedUserId) {
       const cached = getCachedPatron(cachedUserId);
       if (cached) {
@@ -429,6 +814,22 @@ app.get('/callback', async (req, res) => {
         }
       })
     );
+
+    // Commission tracking just needs proof of Patreon identity, not a tier match —
+    // sign the name into a cookie and hand off to /commissions immediately.
+    if (intent === 'commissions') {
+      const fullName = userRes.data?.data?.attributes?.full_name;
+      res.clearCookie('login_referer', loginRefererCookieOptions());
+      if (!fullName) {
+        track('oauth_commissions_missing_name');
+        return res.status(500).send(
+          errorPage({ title: 'Login error', body: 'Patreon did not return a name for your account. Please try again.', retryHref: '/login?intent=commissions' })
+        );
+      }
+      res.cookie('commission_identity', identityCookieSign(fullName), identityCookieOptions());
+      track('oauth_commissions_success');
+      return res.redirect('/commissions');
+    }
 
     const allowedTierIds = (process.env.ALLOWED_TIER_IDS || '')
       .split(',')
@@ -538,6 +939,27 @@ app.get('/callback', async (req, res) => {
       })
     );
   }
+});
+
+// Multer throws synchronously (file too large, wrong mimetype) before the route handler runs —
+// catch it here so uploads fail with a normal error page instead of a raw stack trace.
+app.use((err, req, res, next) => {
+  if (err instanceof multer.MulterError || err?.message?.includes('multipart')) {
+    console.error('Upload error:', err.message);
+    track('commission_edit_upload_rejected', { code: err.code });
+    const token = req.body?.token || req.query?.token || '';
+    return res.status(400).send(commissionsPageShell({
+      title: 'Upload failed',
+      bodyHtml: `
+    <h1>Upload failed</h1>
+    <p>${err.code === 'LIMIT_FILE_SIZE' ? 'That image is too large (8MB max).' : 'That file could not be uploaded — please use a PNG, JPEG, GIF, or WEBP image.'}</p>
+    <div class="actions">
+      <a class="btn btn-primary" href="/commissions/edit?token=${encodeURIComponent(token)}">Back to edit form</a>
+      <a class="btn btn-secondary" href="/commissions">Back to commissions</a>
+    </div>`
+    }));
+  }
+  next(err);
 });
 
 const port = process.env.PORT || 3000;
