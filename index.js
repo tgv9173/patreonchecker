@@ -228,6 +228,10 @@ function escapeHtmlAttr(value) {
     .replace(/</g, '&lt;');
 }
 
+// Reuses the same avatar image as the browser tab favicon — one less asset to maintain.
+const FAVICON_HREF = resolveLandingAvatarSrc();
+const FAVICON_LINK_TAG = FAVICON_HREF ? `<link rel="icon" href="${escapeHtmlAttr(FAVICON_HREF)}">` : '';
+
 function loginRefererCookieOptions() {
   return {
     httpOnly: true,
@@ -257,7 +261,8 @@ app.get('/', (req, res) => {
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>TGV9173 — patron tools</title>
+  ${FAVICON_LINK_TAG}
+  <title>TGV9173 - patron tools</title>
   <style>
     :root { font-family: system-ui, sans-serif; line-height: 1.5; color: #1a1a1a; }
     body { margin: 0; min-height: 100vh; display: flex; flex-direction: column; align-items: center;
@@ -333,6 +338,7 @@ function commissionsPageShell({ title, bodyHtml, maxWidth = '26rem' }) {
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
+  ${FAVICON_LINK_TAG}
   <title>${escapeHtmlAttr(title)}</title>
   <style>
     :root { font-family: system-ui, sans-serif; line-height: 1.5; color: #1a1a1a; }
@@ -352,11 +358,11 @@ function commissionsPageShell({ title, bodyHtml, maxWidth = '26rem' }) {
     a.btn-secondary:hover { background: #f3f4f6; }
     ul.commission-list { list-style: none; margin: 0 0 1.25rem; padding: 0; text-align: left;
       display: flex; flex-direction: column; gap: 0.75rem; }
-    li.commission-card { background: #fff; border: 1px solid #e5e7eb; border-radius: 10px; padding: 0.9rem 1rem; }
-    .commission-card .top-row { display: flex; align-items: center; justify-content: space-between; gap: 0.5rem; margin-bottom: 0.35rem; }
-    .commission-card .character { font-weight: 650; font-size: 1rem; }
+    li.commission-card { background: #fff; border: 1px solid #e5e7eb; border-radius: 10px; padding: 0.9rem 1rem; overflow: hidden; }
+    .commission-card .top-row { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 0.5rem; margin-bottom: 0.35rem; }
+    .commission-card .character { font-weight: 650; font-size: 1rem; overflow-wrap: anywhere; min-width: 0; }
     .commission-card .month { font-size: 0.8rem; color: #6b7280; }
-    .commission-card .outfit { font-size: 0.85rem; color: #444; margin: 0; }
+    .commission-card .outfit { font-size: 0.85rem; color: #444; margin: 0; overflow-wrap: anywhere; }
     .status-badge { display: inline-block; padding: 0.2rem 0.6rem; border-radius: 999px;
       font-size: 0.78rem; font-weight: 650; white-space: nowrap; }
     .status-not-started { background: #f3f4f6; color: #4b5563; border: 1px solid #d1d5db; }
@@ -458,7 +464,7 @@ app.get('/commissions', async (req, res) => {
     if (commissions.length === 0) {
       const notFoundBody = manualUsername
         ? `We couldn't find a commission under the username <strong>${escapeHtmlAttr(manualUsername)}</strong> either.`
-        : `Your Patreon display name (<strong>${escapeHtmlAttr(fullName)}</strong>) doesn't match a commission — that's normal if you submitted with a different username.`;
+        : `Your Patreon display name (<strong>${escapeHtmlAttr(fullName)}</strong>) doesn't match a commission - that's normal if you submitted with a different username.`;
       return res.send(commissionsPageShell({
         title: 'Commission tracking',
         bodyHtml: `
@@ -511,7 +517,7 @@ function editFormPageHtml({ token, commission, error }) {
     maxWidth: '30rem',
     bodyHtml: `
     <h1>Edit your commission</h1>
-    <p class="month">${escapeHtmlAttr(commission.month)} — editing will flag this for the creator to re-review.</p>
+    <p class="month">${escapeHtmlAttr(commission.month)} - editing will flag this for the creator to re-review.</p>
     ${errorHtml}
     <form method="POST" action="/commissions/edit" enctype="multipart/form-data" class="edit-form">
       <input type="hidden" name="token" value="${escapeHtmlAttr(token)}">
@@ -661,6 +667,7 @@ function errorPage({ status, title, body, retryHref }) {
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
+  ${FAVICON_LINK_TAG}
   <title>${escapeHtmlAttr(title)}</title>
   <style>
     :root { font-family: system-ui, sans-serif; line-height: 1.5; color: #1a1a1a; }
@@ -935,7 +942,7 @@ app.get('/callback', async (req, res) => {
     return res.status(500).send(
       errorPage({
         title: 'Authentication error',
-        body: 'Patreon returned an error while verifying your account. This is usually temporary — please try again in a few seconds.',
+        body: 'Patreon returned an error while verifying your account. This is usually temporary - please try again in a few seconds.',
         retryHref: '/login'
       })
     );
@@ -953,7 +960,7 @@ app.use((err, req, res, next) => {
       title: 'Upload failed',
       bodyHtml: `
     <h1>Upload failed</h1>
-    <p>${err.code === 'LIMIT_FILE_SIZE' ? 'That image is too large (8MB max).' : 'That file could not be uploaded — please use a PNG, JPEG, GIF, or WEBP image.'}</p>
+    <p>${err.code === 'LIMIT_FILE_SIZE' ? 'That image is too large (8MB max).' : 'That file could not be uploaded - please use a PNG, JPEG, GIF, or WEBP image.'}</p>
     <div class="actions">
       <a class="btn btn-primary" href="/commissions/edit?token=${encodeURIComponent(token)}">Back to edit form</a>
       <a class="btn btn-secondary" href="/commissions">Back to commissions</a>
