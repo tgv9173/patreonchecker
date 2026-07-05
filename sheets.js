@@ -36,6 +36,15 @@ function normalizeName(value) {
   return String(value || '').trim().toLowerCase().replace(/[^a-z0-9]/g, '');
 }
 
+// Sheet timestamps are "DD/MM/YYYY HH:MM:SS" — plain string comparison sorts them
+// wrong (e.g. "31/01/2026" > "01/02/2026" lexicographically despite being earlier).
+function parseSheetTimestamp(raw) {
+  const m = /^(\d{1,2})\/(\d{1,2})\/(\d{4})\s+(\d{1,2}):(\d{2}):(\d{2})$/.exec(String(raw || '').trim());
+  if (!m) return 0;
+  const [, d, mo, y, h, mi, s] = m.map(Number);
+  return new Date(y, mo - 1, d, h, mi, s).getTime();
+}
+
 // Exact match only. Substring matching (e.g. "rose" inside "roseharlot") was a real
 // privacy bug in production: it let one patron's login pull up a different patron's
 // (often NSFW) commission details just because their names happened to overlap.
@@ -174,7 +183,7 @@ function invalidateCache() {
 async function findCommissionsForPatron(fullName) {
   const all = await getAllCommissionsCached();
   const matches = all.filter(row => isNameMatch(fullName, row.username));
-  matches.sort((a, b) => (b.timestamp || '').localeCompare(a.timestamp || ''));
+  matches.sort((a, b) => parseSheetTimestamp(b.timestamp) - parseSheetTimestamp(a.timestamp));
   return matches;
 }
 
@@ -182,7 +191,7 @@ async function findCommissionsByUsername(username) {
   const all = await getAllCommissionsCached();
   const needle = normalizeName(username);
   const matches = all.filter(row => normalizeName(row.username) === needle);
-  matches.sort((a, b) => (b.timestamp || '').localeCompare(a.timestamp || ''));
+  matches.sort((a, b) => parseSheetTimestamp(b.timestamp) - parseSheetTimestamp(a.timestamp));
   return matches;
 }
 
