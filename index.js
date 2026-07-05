@@ -311,10 +311,10 @@ app.get('/', (req, res) => {
   <main>
     ${avatarMarkup}
     <h1>TGV9173</h1>
-    <p class="sub">My patron utilities: Dropbox folder after login, plus commission tracking when it's ready.</p>
+    <p class="sub">My patron utilities: Dropbox folder after login, plus commission tracking (beta).</p>
     <div class="actions">
       <a class="btn btn-primary" href="/login">Login and get folder link</a>
-      <a class="btn btn-secondary" href="/commissions">Commission tracking</a>
+      <a class="btn btn-secondary" href="/commissions">Commission tracking (beta)</a>
     </div>
     <div class="social">
       <a class="icon-btn patreon" href="${patreonHref}" target="_blank" rel="noopener noreferrer" aria-label="TGV9173 on Patreon">
@@ -356,13 +356,6 @@ function commissionsPageShell({ title, bodyHtml, maxWidth = '26rem' }) {
     a.btn-primary:hover { background: #1d4ed8; }
     a.btn-secondary { background: #fff; color: #1a1a1a; border-color: #d1d5db; }
     a.btn-secondary:hover { background: #f3f4f6; }
-    ul.commission-list { list-style: none; margin: 0 0 1.25rem; padding: 0; text-align: left;
-      display: flex; flex-direction: column; gap: 0.75rem; }
-    li.commission-card { background: #fff; border: 1px solid #e5e7eb; border-radius: 10px; padding: 0.9rem 1rem; overflow: hidden; }
-    .commission-card .top-row { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 0.5rem; margin-bottom: 0.35rem; }
-    .commission-card .character { font-weight: 650; font-size: 1rem; overflow-wrap: anywhere; min-width: 0; }
-    .commission-card .month { font-size: 0.8rem; color: #6b7280; }
-    .commission-card .outfit { font-size: 0.85rem; color: #444; margin: 0; overflow-wrap: anywhere; }
     .status-badge { display: inline-block; padding: 0.2rem 0.6rem; border-radius: 999px;
       font-size: 0.78rem; font-weight: 650; white-space: nowrap; }
     .status-not-started { background: #f3f4f6; color: #4b5563; border: 1px solid #d1d5db; }
@@ -371,7 +364,22 @@ function commissionsPageShell({ title, bodyHtml, maxWidth = '26rem' }) {
     .status-approved { background: #bbf7d0; color: #14532d; }
     .status-delivered { background: #bfdbfe; color: #1e3a8a; }
     .status-unknown { background: #f3f4f6; color: #4b5563; }
-    .commission-card .edit-link { font-size: 0.8rem; font-weight: 650; }
+    p.beta-note { font-size: 0.8rem; color: #6b7280; margin-top: -0.5rem; }
+    .filter-bar { display: flex; flex-wrap: wrap; gap: 0.4rem; margin: 0 0 1rem; }
+    .filter-btn { font: inherit; cursor: pointer; padding: 0.3rem 0.7rem; border-radius: 999px;
+      font-size: 0.78rem; font-weight: 650; border: 1px solid #d1d5db; background: #fff; color: #4b5563; }
+    .filter-btn.active { background: #1a1a1a; color: #fff; border-color: #1a1a1a; }
+    .table-scroll { width: 100%; overflow-x: auto; margin: 0 0 1.25rem; border: 1px solid #e5e7eb; border-radius: 10px; }
+    table.commission-table { width: 100%; border-collapse: collapse; text-align: left; font-size: 0.85rem; background: #fff; }
+    .commission-table th, .commission-table td { padding: 0.65rem 0.75rem; vertical-align: top; border-bottom: 1px solid #e5e7eb; }
+    .commission-table thead th { font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.03em;
+      color: #6b7280; background: #f9fafb; white-space: nowrap; }
+    .commission-table tbody tr:last-child td { border-bottom: none; }
+    .commission-table tbody tr.filtered-out { display: none; }
+    .commission-table .character { font-weight: 650; overflow-wrap: anywhere; }
+    .commission-table .outfit { color: #444; margin: 0.2rem 0 0; overflow-wrap: anywhere; }
+    .commission-table .month { color: #6b7280; white-space: nowrap; }
+    .commission-table .edit-link { font-weight: 650; white-space: nowrap; }
     .manual-search { text-align: left; display: flex; flex-direction: column; gap: 0.4rem; margin: 0 0 1.25rem; }
     .manual-search label { font-size: 0.85rem; font-weight: 600; color: #333; }
     .manual-search input[type="text"] { padding: 0.6rem 0.75rem; border-radius: 8px; border: 1px solid #d1d5db; font-size: 0.95rem; }
@@ -418,22 +426,59 @@ function manualSearchFormHtml(prefillValue = '') {
     </form>`;
 }
 
-function commissionCardHtml(c) {
+function commissionRowHtml(c) {
   const editLink = c.editable
     ? `<a class="edit-link" href="/commissions/edit?token=${encodeURIComponent(editTokenSign({ month: c.month, rowNumber: c.rowNumber, username: c.username }))}">Edit</a>`
     : '';
+  const statusClass = statusBadgeClass(c.status);
   return `
-      <li class="commission-card">
-        <div class="top-row">
-          <span class="character">${escapeHtmlAttr(c.character || 'Untitled')}</span>
-          <span class="status-badge ${statusBadgeClass(c.status)}">${escapeHtmlAttr(c.status)}</span>
-        </div>
-        <p class="outfit">${escapeHtmlAttr(c.outfit || '')}</p>
-        <div class="top-row">
-          <span class="month">${escapeHtmlAttr(c.month)}</span>
-          ${editLink}
-        </div>
-      </li>`;
+      <tr data-status="${statusClass}">
+        <td>
+          <div class="character">${escapeHtmlAttr(c.character || 'Untitled')}</div>
+          <p class="outfit">${escapeHtmlAttr(c.outfit || '')}</p>
+        </td>
+        <td><span class="status-badge ${statusClass}">${escapeHtmlAttr(c.status)}</span></td>
+        <td class="month">${escapeHtmlAttr(c.month)}</td>
+        <td>${editLink}</td>
+      </tr>`;
+}
+
+const STATUS_FILTERS = [
+  { key: 'all', label: 'All' },
+  { key: 'status-not-started', label: 'Not started' },
+  { key: 'status-preview-sent', label: 'Preview sent' },
+  { key: 'status-changes-requested', label: 'Changes requested' },
+  { key: 'status-approved', label: 'Approved' },
+  { key: 'status-delivered', label: 'Delivered' }
+];
+
+// Client-side only — the table always renders every commission; filtering just hides rows.
+// Keeps the page a plain server-rendered load with no extra request round-trip to filter.
+function commissionTableHtml(commissions) {
+  const rowsHtml = commissions.map(commissionRowHtml).join('');
+  const filterButtonsHtml = STATUS_FILTERS.map((f, i) =>
+    `<button type="button" class="filter-btn${i === 0 ? ' active' : ''}" data-filter="${f.key}">${escapeHtmlAttr(f.label)}</button>`
+  ).join('');
+  return `
+    <div class="filter-bar" id="statusFilterBar">${filterButtonsHtml}</div>
+    <div class="table-scroll">
+      <table class="commission-table">
+        <thead><tr><th>Commission</th><th>Status</th><th>Submitted</th><th></th></tr></thead>
+        <tbody id="commissionTableBody">${rowsHtml}</tbody>
+      </table>
+    </div>
+    <script>
+      document.getElementById('statusFilterBar').addEventListener('click', function (e) {
+        var btn = e.target.closest('.filter-btn');
+        if (!btn) return;
+        this.querySelectorAll('.filter-btn').forEach(function (b) { b.classList.remove('active'); });
+        btn.classList.add('active');
+        var filter = btn.dataset.filter;
+        document.querySelectorAll('#commissionTableBody tr').forEach(function (row) {
+          row.classList.toggle('filtered-out', filter !== 'all' && row.dataset.status !== filter);
+        });
+      });
+    </script>`;
 }
 
 app.get('/commissions', async (req, res) => {
@@ -478,14 +523,13 @@ app.get('/commissions', async (req, res) => {
       }));
     }
 
-    const listHtml = commissions.map(commissionCardHtml).join('');
-
     res.send(commissionsPageShell({
       title: 'Commission tracking',
-      maxWidth: '30rem',
+      maxWidth: '40rem',
       bodyHtml: `
     <h1>Your commissions</h1>
-    <ul class="commission-list">${listHtml}</ul>
+    <p class="beta-note">Sorted by most recently submitted first. Commission tracking is in beta - let the creator know on Patreon if something looks off.</p>
+    ${commissionTableHtml(commissions)}
     <details class="manual-search-details">
       <summary>Not seeing a commission? Search a different username</summary>
       ${manualSearchFormHtml(manualUsername)}
