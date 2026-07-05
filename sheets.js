@@ -36,11 +36,14 @@ function normalizeName(value) {
   return String(value || '').trim().toLowerCase().replace(/[^a-z0-9]/g, '');
 }
 
+// Exact match only. Substring matching (e.g. "rose" inside "roseharlot") was a real
+// privacy bug in production: it let one patron's login pull up a different patron's
+// (often NSFW) commission details just because their names happened to overlap.
 function isNameMatch(patreonFullName, sheetUsername) {
   const a = normalizeName(patreonFullName);
   const b = normalizeName(sheetUsername);
   if (!a || !b) return false;
-  return a === b || a.includes(b) || b.includes(a);
+  return a === b;
 }
 
 function colorDistance(c1, c2) {

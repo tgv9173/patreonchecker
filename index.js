@@ -407,7 +407,7 @@ function manualSearchFormHtml(prefillValue = '') {
   return `
     <form class="manual-search" method="GET" action="/commissions">
       <label for="manualUsername">Search by the Patreon username you submitted with</label>
-      <input type="text" id="manualUsername" name="manualUsername" value="${escapeHtmlAttr(prefillValue)}" placeholder="e.g. mrK" required>
+      <input type="text" id="manualUsername" name="manualUsername" value="${escapeHtmlAttr(prefillValue)}" placeholder="your Patreon username" required>
       <button type="submit" class="btn btn-secondary">Search</button>
     </form>`;
 }
@@ -458,13 +458,14 @@ app.get('/commissions', async (req, res) => {
     if (commissions.length === 0) {
       const notFoundBody = manualUsername
         ? `We couldn't find a commission under the username <strong>${escapeHtmlAttr(manualUsername)}</strong> either.`
-        : `We couldn't find a commission under the Patreon name <strong>${escapeHtmlAttr(fullName)}</strong>.`;
+        : `Your Patreon display name (<strong>${escapeHtmlAttr(fullName)}</strong>) doesn't match a commission — that's normal if you submitted with a different username.`;
       return res.send(commissionsPageShell({
         title: 'Commission tracking',
         bodyHtml: `
     <h1>No commission found</h1>
-    <p>${notFoundBody} If you submitted under a different name, try searching for it below, or message the creator directly on Patreon.</p>
+    <p>${notFoundBody} Enter the exact username you used when submitting your commission request:</p>
     ${manualSearchFormHtml(manualUsername)}
+    <p>Still nothing? Message the creator directly on Patreon.</p>
     <div class="actions">
       <a class="btn btn-secondary" href="/">Back to home</a>
     </div>`
