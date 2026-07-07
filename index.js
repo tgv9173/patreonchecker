@@ -691,7 +691,8 @@ app.get('/login', (req, res) => {
   // no extra cookie needed to remember why the user logged in.
   const state = `${crypto.randomBytes(16).toString('hex')}.${intent}`;
   res.cookie('login_referer', referer, loginRefererCookieOptions());
-  res.cookie('oauth_state', state, loginRefererCookieOptions());
+  // Persistent (10-min TTL) so mobile browsers that suspend the tab during Patreon auth don't lose the session cookie.
+  res.cookie('oauth_state', state, { ...loginRefererCookieOptions(), maxAge: 10 * 60 * 1000 });
   const params = querystring.stringify({
     response_type: 'code',
     client_id: CLIENT_ID,
@@ -768,7 +769,11 @@ app.get('/callback', async (req, res) => {
   }
 
   if (!returnedState || !expectedState || returnedState !== expectedState) {
-    track('oauth_state_mismatch');
+    track('oauth_state_mismatch', {
+      noCookie: !expectedState,
+      noState: !returnedState,
+      valueMismatch: !!(returnedState && expectedState && returnedState !== expectedState)
+    });
     res.clearCookie('login_referer', loginRefererCookieOptions());
     res.clearCookie('oauth_state', loginRefererCookieOptions());
     return res.status(400).send(
