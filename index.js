@@ -59,6 +59,34 @@ const AUTH_CACHE_TTL_MS = 60 * 60 * 1000; // 1 hour
 const SESSION_SECRET = crypto.randomBytes(32); // rotates on restart — cache cookies become invalid, users re-authenticate
 const patronCache = new Map(); // patreonUserId → { matched, expires }
 
+// Stable secret for HMAC-signed OAuth state (survives restarts; set OAUTH_STATE_SECRET in Render env).
+// Falls back to SESSION_SECRET so state mismatch can still happen on restart if the env var is absent —
+// but that's the same as before. With the env var set, in-flight logins survive restarts.
+const OAUTH_STATE_SECRET = (process.env.OAUTH_STATE_SECRET || '').trim() || SESSION_SECRET;
+
+function makeOAuthState(intent) {
+  const nonce = crypto.randomBytes(16).toString('hex');
+  const payload = `${nonce}.${intent}`;
+  const sig = crypto.createHmac('sha256', OAUTH_STATE_SECRET).update(payload).digest('base64url');
+  return `${payload}.${sig}`;
+}
+
+// Returns the intent ('default' | 'commissions') if the HMAC is valid, null otherwise.
+// No cookie needed — CSRF protection comes from the server secret, not a stored value.
+function verifyOAuthState(state) {
+  if (typeof state !== 'string') return null;
+  const lastDot = state.lastIndexOf('.');
+  if (lastDot < 0) return null;
+  const payload = state.slice(0, lastDot);
+  const sig = state.slice(lastDot + 1);
+  const expected = crypto.createHmac('sha256', OAUTH_STATE_SECRET).update(payload).digest('base64url');
+  try {
+    if (!crypto.timingSafeEqual(Buffer.from(sig, 'base64url'), Buffer.from(expected, 'base64url'))) return null;
+  } catch { return null; }
+  const intent = payload.split('.')[1];
+  return intent === 'commissions' ? 'commissions' : 'default';
+}
+
 function patronCookieSign(userId) {
   const expires = Date.now() + AUTH_CACHE_TTL_MS;
   const payload = `${userId}|${expires}`;
@@ -166,9 +194,14 @@ function getCachedPatron(userId) {
   return entry;
 }
 
+// Backoffs in ms between retry attempts: 2s, 8s, 20s, 40s (total ~70s across 5 attempts).
+// Patreon's Cloudflare edge sometimes returns retry_after: 120; we can't wait that long in a
+// live request, but spreading attempts over ~70s gives us multiple chances to hit a clear window.
+const RETRY_BACKOFFS_MS = [2000, 8000, 20000, 40000];
+
 /** Retries Patreon HTTP calls on timeouts / 502–504 (common when their edge is slow). */
 async function patreonRequest(label, axiosCall) {
-  const maxAttempts = 3;
+  const maxAttempts = RETRY_BACKOFFS_MS.length + 1;
   let lastErr;
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     try {
@@ -194,7 +227,7 @@ async function patreonRequest(label, axiosCall) {
         ax ? { status: ax.status, data: ax.data } : err.code || err.message
       );
       if (!retry) throw err;
-      await new Promise(r => setTimeout(r, 1000 * attempt));
+      await new Promise(r => setTimeout(r, RETRY_BACKOFFS_MS[attempt - 1]));
     }
   }
   throw lastErr;
@@ -687,12 +720,10 @@ app.get('/login', (req, res) => {
   const referer = req.get('Referer') || 'No referer';
   const intent = req.query.intent === 'commissions' ? 'commissions' : 'default';
   track('login_started', { referer: referer === 'No referer' ? undefined : referer.slice(0, 500), intent });
-  // Intent travels round-trip inside the CSRF state itself (verified exact-match on return) —
-  // no extra cookie needed to remember why the user logged in.
-  const state = `${crypto.randomBytes(16).toString('hex')}.${intent}`;
+  // State is HMAC-signed — verified on return without any cookie, so it survives mobile tab suspension,
+  // cookie-blocking proxies, and server restarts (given OAUTH_STATE_SECRET env var is set).
+  const state = makeOAuthState(intent);
   res.cookie('login_referer', referer, loginRefererCookieOptions());
-  // Persistent (10-min TTL) so mobile browsers that suspend the tab during Patreon auth don't lose the session cookie.
-  res.cookie('oauth_state', state, { ...loginRefererCookieOptions(), maxAge: 10 * 60 * 1000 });
   const params = querystring.stringify({
     response_type: 'code',
     client_id: CLIENT_ID,
@@ -749,7 +780,6 @@ app.get('/callback', async (req, res) => {
   const code = req.query.code;
   const returnedState = req.query.state;
   const loginReferer = req.cookies.login_referer || 'No referer';
-  const expectedState = req.cookies.oauth_state;
 
   if (oauthError) {
     console.error('OAuth denied or error:', oauthError, oauthDescription || '');
@@ -768,24 +798,18 @@ app.get('/callback', async (req, res) => {
     );
   }
 
-  if (!returnedState || !expectedState || returnedState !== expectedState) {
-    track('oauth_state_mismatch', {
-      noCookie: !expectedState,
-      noState: !returnedState,
-      valueMismatch: !!(returnedState && expectedState && returnedState !== expectedState)
-    });
+  const intent = verifyOAuthState(returnedState);
+  if (!intent) {
+    track('oauth_state_mismatch', { noState: !returnedState, invalidHmac: Boolean(returnedState) });
     res.clearCookie('login_referer', loginRefererCookieOptions());
-    res.clearCookie('oauth_state', loginRefererCookieOptions());
     return res.status(400).send(
       errorPage({
         title: 'Session expired',
-        body: 'Your login session has expired or was opened in a different browser tab. Please start the login flow again.',
+        body: 'Your login session has expired. Please start the login flow again.',
         retryHref: '/login'
       })
     );
   }
-  res.clearCookie('oauth_state', loginRefererCookieOptions());
-  const intent = returnedState.split('.')[1] === 'commissions' ? 'commissions' : 'default';
 
   if (!code) {
     track('oauth_missing_code');
@@ -983,6 +1007,7 @@ app.get('/callback', async (req, res) => {
       );
     }
 
+    const isPatreonOverloaded = ax?.status === 504 || ax?.status === 503 || ax?.status === 502;
     track('oauth_request_failed', {
       httpStatus: ax?.status,
       patreonOAuthError: oauthErr || undefined,
@@ -990,8 +1015,10 @@ app.get('/callback', async (req, res) => {
     });
     return res.status(500).send(
       errorPage({
-        title: 'Authentication error',
-        body: 'Patreon returned an error while verifying your account. This is usually temporary - please try again in a few seconds.',
+        title: isPatreonOverloaded ? 'Patreon servers are busy' : 'Authentication error',
+        body: isPatreonOverloaded
+          ? 'Patreon\'s servers are currently overloaded and could not verify your tier after several retries. Your Patreon account is fine — please wait 2–3 minutes and try again.'
+          : 'Patreon returned an error while verifying your account. Please try again.',
         retryHref: '/login'
       })
     );
