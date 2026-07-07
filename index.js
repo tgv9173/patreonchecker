@@ -876,13 +876,14 @@ app.get('/callback', async (req, res) => {
       }
     }
 
-    // Patreon API v2: only request relationship IDs — attributes on member/tier are unused.
+    // Patreon API v2: omit "memberships.currently_entitled_tiers" from include — fetching the full
+    // tier objects causes 504s for patrons with large pledge histories (Patreon bug, June 2026).
+    // Tier IDs are still present in member.relationships.currently_entitled_tiers.data per JSON:API spec.
     // (Do not add memberships.campaign without the "campaigns" scope — it can 400.)
     const identityQuery = querystring.stringify({
-      include: 'memberships,memberships.currently_entitled_tiers',
+      include: 'memberships',
       'fields[user]': 'full_name',
-      'fields[member]': 'patron_status',
-      'fields[tier]': 'title'
+      'fields[member]': 'patron_status'
     });
 
     const userRes = await patreonRequest('Patreon identity', () =>
