@@ -876,14 +876,13 @@ app.get('/callback', async (req, res) => {
       }
     }
 
-    // Patreon API v2: omit "memberships.currently_entitled_tiers" from include — fetching the full
-    // tier objects causes 504s for patrons with large pledge histories (Patreon bug, June 2026).
-    // Tier IDs are still present in member.relationships.currently_entitled_tiers.data per JSON:API spec.
+    // Patreon API v2: only request relationship IDs — attributes on member/tier are unused.
     // (Do not add memberships.campaign without the "campaigns" scope — it can 400.)
     const identityQuery = querystring.stringify({
-      include: 'memberships',
+      include: 'memberships,memberships.currently_entitled_tiers',
       'fields[user]': 'full_name',
-      'fields[member]': 'patron_status'
+      'fields[member]': 'patron_status',
+      'fields[tier]': 'title'
     });
 
     const userRes = await patreonRequest('Patreon identity', () =>
@@ -936,8 +935,25 @@ app.get('/callback', async (req, res) => {
       (item.relationships?.currently_entitled_tiers?.data || []).map(tier => tier.id)
     );
 
-    const matched = userTierIds.some(id => allowedTierIds.includes(id));
     const patreonUserId = userRes.data?.data?.id;
+
+    // Per-user whitelist for patrons whose accounts trigger Patreon's identity API 504 bug
+    // (large pledge history causes currently_entitled_tiers to time out — Patreon bug June 2026).
+    // Set PATREON_ALLOWED_USER_IDS=id1,id2 in Render env to bypass the tier check for specific users.
+    const allowedUserIds = (process.env.PATREON_ALLOWED_USER_IDS || '')
+      .split(',').map(id => id.trim()).filter(Boolean);
+    if (patreonUserId && allowedUserIds.includes(patreonUserId)) {
+      patronCache.set(patreonUserId, { matched: true, expires: Date.now() + AUTH_CACHE_TTL_MS });
+      res.cookie('patron_verified', patronCookieSign(patreonUserId), {
+        httpOnly: true, sameSite: 'lax',
+        secure: process.env.NODE_ENV === 'production', maxAge: AUTH_CACHE_TTL_MS
+      });
+      track('oauth_success', { patreonUserId, whitelisted: true });
+      res.clearCookie('login_referer', loginRefererCookieOptions());
+      return res.redirect(SUCCESS_REDIRECT_URI);
+    }
+
+    const matched = userTierIds.some(id => allowedTierIds.includes(id));
 
     // Cache the result and set signed cookie for future logins within 1 hour
     if (patreonUserId) {
