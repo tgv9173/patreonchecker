@@ -9,22 +9,45 @@ const multer = require('multer');
 
 const { track, TRACK_HOME } = require('./analytics');
 const {
+  isNameMatch,
   findCommissionsForPatron,
   findCommissionsByUsername,
   getFreshCommissionRow,
   updateCommissionRow,
-  flagRowChangesRequested
+  flagRowChangesRequested,
+  setRowStatusByLabel,
+  appendCommissionSubmission,
+  appendRequestSubmission
 } = require('./sheets');
 
 const app = express();
 app.set('trust proxy', 1);
 
+// Rejecting a wrong-type file must be an ERROR, not a silent drop: cb(null, false)
+// omits the file and the submit still "succeeds", so the patron believes their
+// reference was attached when it wasn't. Uses a real MulterError so the shared upload
+// error handler below renders it; `invalidType` disambiguates from multer's own
+// LIMIT_UNEXPECTED_FILE (which .array() also throws for too-many-files).
+function imageTypeFilter(req, file, cb) {
+  if (/^image\/(png|jpe?g|gif|webp)$/i.test(file.mimetype)) return cb(null, true);
+  const err = new multer.MulterError('LIMIT_UNEXPECTED_FILE', file.fieldname);
+  err.invalidType = true;
+  cb(err);
+}
+
 const upload = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: 8 * 1024 * 1024, files: 1 },
-  fileFilter: (req, file, cb) => {
-    cb(null, /^image\/(png|jpe?g|gif|webp)$/i.test(file.mimetype));
-  }
+  fileFilter: imageTypeFilter
+});
+
+// Separate instance (not just a different .array()/.single() call on `upload` above) so
+// its files:5 limit doesn't loosen the single-file cap the existing edit form relies on.
+const REFERENCE_IMAGE_LIMIT = 5;
+const uploadReferenceImages = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 8 * 1024 * 1024, files: REFERENCE_IMAGE_LIMIT },
+  fileFilter: imageTypeFilter
 });
 
 async function uploadToCatbox(file) {
@@ -39,12 +62,44 @@ async function uploadToCatbox(file) {
   return text;
 }
 
+// Uploads each file to catbox in turn and returns the URLs, in order. Uploads
+// sequentially (not Promise.all) so one file's failure doesn't leave the others
+// half-uploaded in an unpredictable order, and so catbox doesn't see a burst.
+async function uploadReferenceImagesToCatbox(files) {
+  const urls = [];
+  for (const file of files || []) {
+    urls.push(await uploadToCatbox(file));
+  }
+  return urls;
+}
+
+
+const MONTH_NAMES_LOWER = [
+  'january', 'february', 'march', 'april', 'may', 'june',
+  'july', 'august', 'september', 'october', 'november', 'december'
+];
+
+// Fire-and-forget creator notification to a Discord webhook (set
+// DISCORD_NOTIFY_WEBHOOK on Render to enable). Never awaited on the request path and
+// never allowed to fail a patron-facing action — it's telemetry for the creator, not
+// part of the submission.
+const DISCORD_NOTIFY_WEBHOOK = process.env.DISCORD_NOTIFY_WEBHOOK;
+function notifyDiscord(text) {
+  if (!DISCORD_NOTIFY_WEBHOOK) return;
+  axios.post(DISCORD_NOTIFY_WEBHOOK, { content: text.slice(0, 1900) }, { timeout: 8000 })
+    .catch(err => console.error('Discord notify failed:', err.message));
+}
+
 const CLIENT_ID = process.env.CLIENT_ID;
 const CLIENT_SECRET = process.env.CLIENT_SECRET;
 // Must match Patreon developer portal "Redirect URIs" exactly (set on Render + in Patreon).
 const REDIRECT_URI = process.env.REDIRECT_URI || 'https://patreon-checker.onrender.com/callback';
 const ALLOWED_TIER_IDS = process.env.ALLOWED_TIER_IDS;
 const SUCCESS_REDIRECT_URI = process.env.SUCCESS_REDIRECT_URI;
+// Deliberately separate from ALLOWED_TIER_IDS above: that one gates the Dropbox-folder
+// link and may allow broader tiers, but only the commissioner tier actually gets a
+// commission with their subscription, so /commissions/new checks this instead.
+const COMMISSIONER_TIER_IDS = process.env.COMMISSIONER_TIER_IDS;
 
 // Patreon's edge/WAF commonly rejects requests without a descriptive User-Agent (400 with empty body).
 // Override via Render env if needed. https://www.patreondevelopers.com/t/status-400-https-www-patreon-com-api-oauth2-v2-identity/8836
@@ -84,7 +139,9 @@ function verifyOAuthState(state) {
     if (!crypto.timingSafeEqual(Buffer.from(sig, 'base64url'), Buffer.from(expected, 'base64url'))) return null;
   } catch { return null; }
   const intent = payload.split('.')[1];
-  return intent === 'commissions' ? 'commissions' : 'default';
+  // LOGIN_INTENTS (defined near the form routes) also covers 'commission-request'
+  // and 'requests' — anything unrecognized degrades to the default folder-link flow.
+  return LOGIN_INTENTS.includes(intent) ? intent : 'default';
 }
 
 function patronCookieSign(userId) {
@@ -199,6 +256,33 @@ function getCachedPatron(userId) {
 // live request, but spreading attempts over ~70s gives us multiple chances to hit a clear window.
 const RETRY_BACKOFFS_MS = [2000, 8000, 20000, 40000];
 
+function parseTierIds(raw) {
+  return (raw || '')
+    .split(',')
+    .map(id => id.trim())
+    .filter(id => id);
+}
+
+// Patreon API v2: only request relationship IDs — attributes on member/tier are unused.
+// (Do not add memberships.campaign without the "campaigns" scope — it can 400.)
+function extractPatreonMembership(userRes) {
+  const memberships = userRes.data.included || [];
+  let memberItems = memberships.filter(item => item.type === 'member');
+  if (PATREON_CAMPAIGN_ID) {
+    memberItems = memberItems.filter(
+      m => m.relationships?.campaign?.data?.id === PATREON_CAMPAIGN_ID
+    );
+  }
+  const userTierIds = memberItems.flatMap(item =>
+    (item.relationships?.currently_entitled_tiers?.data || []).map(tier => tier.id)
+  );
+  return { memberItems, userTierIds };
+}
+
+function tierMatches(userTierIds, allowedTierIds) {
+  return userTierIds.some(id => allowedTierIds.includes(id));
+}
+
 /** Retries Patreon HTTP calls on timeouts / 502–504 (common when their edge is slow). */
 async function patreonRequest(label, axiosCall) {
   const maxAttempts = RETRY_BACKOFFS_MS.length + 1;
@@ -226,10 +310,17 @@ async function patreonRequest(label, axiosCall) {
         `${label} failed (attempt ${attempt}/${maxAttempts}):`,
         ax ? { status: ax.status, data: ax.data } : err.code || err.message
       );
-      if (!retry) throw err;
+      if (!retry) {
+        // Tags which Patreon call failed so the /callback catch block can tell a dead
+        // identity lookup (see the "too many memberships" note below) apart from a dead
+        // token exchange (usually just an expired/reused code).
+        err.patreonRequestLabel = label;
+        throw err;
+      }
       await new Promise(r => setTimeout(r, RETRY_BACKOFFS_MS[attempt - 1]));
     }
   }
+  lastErr.patreonRequestLabel = label;
   throw lastErr;
 }
 
@@ -275,7 +366,79 @@ function loginRefererCookieOptions() {
 
 // Store referer from /login in a cookie
 app.use(cookieParser());
+app.use(express.urlencoded({ extended: true }));
 app.use(express.static(PUBLIC_DIR));
+
+// In-memory rate limit for the two submission forms: 4 submissions per rolling hour,
+// keyed by verified identity AND by IP (whichever trips first). The request form is
+// deliberately open to any Patreon account, and both forms relay images to catbox —
+// without a cap the site is a free image-host proxy and the sheet can be spammed.
+// In-memory is fine here: single Render instance, and a restart resetting counters
+// only ever errs in the patron's favor.
+const SUBMIT_LIMIT = 4;
+const SUBMIT_WINDOW_MS = 60 * 60 * 1000;
+const submitLog = new Map(); // key -> [timestamps]
+
+function submitAllowed(keys) {
+  const now = Date.now();
+  if (submitLog.size > 5000) {
+    for (const [k, times] of submitLog) {
+      if (!times.some(t => now - t < SUBMIT_WINDOW_MS)) submitLog.delete(k);
+    }
+  }
+  const blocked = keys.some(key => {
+    const times = (submitLog.get(key) || []).filter(t => now - t < SUBMIT_WINDOW_MS);
+    submitLog.set(key, times);
+    return times.length >= SUBMIT_LIMIT;
+  });
+  if (blocked) return false;
+  for (const key of keys) submitLog.get(key).push(now);
+  return true;
+}
+
+function rateLimitKeys(req, fullName) {
+  return [`id:${fullName.toLowerCase()}`, `ip:${req.ip}`];
+}
+
+function rateLimitedPage(backHref) {
+  return commissionsPageShell({
+    title: 'Too many submissions',
+    bodyHtml: `
+    <h1>Slow down a little</h1>
+    <p>You have reached the limit of ${SUBMIT_LIMIT} submissions per hour. Please wait a bit and try again - your form content is not lost if you keep the tab open.</p>
+    <div class="actions">
+      <a class="btn btn-primary" href="${escapeHtmlAttr(backHref)}">Back to form</a>
+      <a class="btn btn-secondary" href="/">Back to home</a>
+    </div>`
+  });
+}
+
+// Double-submit CSRF protection for the two authenticated-cookie POST forms below
+// (commission request, wishlist request) — a plain session cookie alone doesn't stop
+// another site from auto-submitting a form using it, so every such form carries a token
+// that must match what's in the cookie.
+function csrfTokenCookieOptions() {
+  return { httpOnly: true, sameSite: 'lax', secure: process.env.NODE_ENV === 'production' };
+}
+
+// Cookie name is per-form ('commission' / 'request') so having both forms open in two
+// tabs doesn't invalidate the older tab's token when the newer one issues its own.
+function issueCsrfToken(res, formName) {
+  const token = crypto.randomBytes(24).toString('hex');
+  res.cookie(`csrf_token_${formName}`, token, csrfTokenCookieOptions());
+  return token;
+}
+
+function verifyCsrfToken(req, formName) {
+  const cookieToken = req.cookies[`csrf_token_${formName}`];
+  const formToken = req.body?.csrfToken;
+  if (!cookieToken || !formToken) return false;
+  try {
+    return crypto.timingSafeEqual(Buffer.from(cookieToken), Buffer.from(formToken));
+  } catch {
+    return false;
+  }
+}
 
 app.get('/', (req, res) => {
   if (TRACK_HOME) track('page_home');
@@ -344,10 +507,12 @@ app.get('/', (req, res) => {
   <main>
     ${avatarMarkup}
     <h1>TGV9173</h1>
-    <p class="sub">My patron utilities: Dropbox folder after login, plus commission tracking (beta).</p>
+    <p class="sub">My patron utilities: Dropbox folder after login, plus commission tools (beta).</p>
     <div class="actions">
       <a class="btn btn-primary" href="/login">Login and get folder link</a>
+      <a class="btn btn-secondary" href="/commissions/new">Submit a commission (beta)</a>
       <a class="btn btn-secondary" href="/commissions">Commission tracking (beta)</a>
+      <a class="btn btn-secondary" href="/requests/new">Submit a request (beta)</a>
     </div>
     <div class="social">
       <a class="icon-btn patreon" href="${patreonHref}" target="_blank" rel="noopener noreferrer" aria-label="TGV9173 on Patreon">
@@ -395,6 +560,8 @@ function commissionsPageShell({ title, bodyHtml, maxWidth = '26rem' }) {
     .status-preview-sent { background: #fdead2; color: #92400e; }
     .status-changes-requested { background: #fecaca; color: #991b1b; }
     .status-approved { background: #bbf7d0; color: #14532d; }
+    .status-needs-regeneration { background: #fed7aa; color: #9a3412; }
+    .status-ready-to-upload { background: #ccfbf1; color: #115e59; }
     .status-delivered { background: #bfdbfe; color: #1e3a8a; }
     .status-unknown { background: #f3f4f6; color: #4b5563; }
     p.beta-note { font-size: 0.8rem; color: #6b7280; margin-top: -0.5rem; }
@@ -427,6 +594,21 @@ function commissionsPageShell({ title, bodyHtml, maxWidth = '26rem' }) {
     }
     .edit-form .actions { margin-top: 0.75rem; }
     .form-error { background: #fecaca; color: #991b1b; padding: 0.6rem 0.85rem; border-radius: 8px; font-size: 0.85rem; text-align: left; }
+    .row-actions { white-space: nowrap; }
+    .row-actions .approve-form { display: inline; margin-right: 0.5rem; }
+    .btn-approve { background: #16a34a; color: #fff; border: none; border-radius: 7px; padding: 0.4rem 0.7rem;
+      font-size: 0.8rem; font-weight: 600; cursor: pointer; font-family: inherit; }
+    .btn-approve:hover { background: #15803d; }
+    .dup-warn { background: #fef3c7; color: #92400e; border-radius: 8px; padding: 0.7rem 0.9rem;
+      font-size: 0.85rem; text-align: left; margin-bottom: 0.75rem; }
+    .field-help { font-size: 0.8rem; color: #6b7280; margin: 0.15rem 0 0.35rem; }
+    .checkbox-group { display: flex; flex-direction: column; gap: 0.1rem; margin: 0.2rem 0 0.5rem; }
+    .checkbox-group label { display: flex; align-items: center; gap: 0.5rem; font-size: 0.9rem;
+      font-weight: 400; color: #1a1a1a; margin-top: 0.3rem; }
+    .checkbox-group input[type="text"] { flex: 1; padding: 0.4rem 0.6rem; border-radius: 6px;
+      border: 1px solid #d1d5db; font-size: 0.9rem; font-family: inherit; }
+    .agree-check { display: flex; align-items: flex-start; gap: 0.5rem; margin-top: 1rem; font-size: 0.85rem; text-align: left; }
+    .agree-check input { margin-top: 0.2rem; flex-shrink: 0; }
   </style>
 </head>
 <body>
@@ -443,6 +625,8 @@ function statusBadgeClass(status) {
   if (key.includes('preview')) return 'status-preview-sent';
   if (key.includes('changes')) return 'status-changes-requested';
   if (key.includes('approved')) return 'status-approved';
+  if (key.includes('regeneration')) return 'status-needs-regeneration';
+  if (key.includes('ready to upload')) return 'status-ready-to-upload';
   if (key.includes('delivered')) return 'status-delivered';
   return 'status-unknown';
 }
@@ -460,10 +644,23 @@ function manualSearchFormHtml(prefillValue = '') {
 }
 
 function commissionRowHtml(c) {
-  const editLink = c.editable
-    ? `<a class="edit-link" href="/commissions/edit?token=${encodeURIComponent(editTokenSign({ month: c.month, rowNumber: c.rowNumber, username: c.username }))}">Edit</a>`
-    : '';
+  const token = editTokenSign({ month: c.month, rowNumber: c.rowNumber, username: c.username });
   const statusClass = statusBadgeClass(c.status);
+  // Preview-sent rows get the approval pair: Approve closes the loop right here
+  // instead of a Patreon DM round-trip; "Request changes" IS the existing edit flow
+  // (editing a preview-sent row already flags it changes-requested), just labeled for
+  // what it does at this stage.
+  let actions = '';
+  if (statusClass === 'status-preview-sent') {
+    actions = `
+          <form method="POST" action="/commissions/approve" class="approve-form">
+            <input type="hidden" name="token" value="${escapeHtmlAttr(token)}">
+            <button type="submit" class="btn-approve">Approve ✓</button>
+          </form>
+          <a class="edit-link" href="/commissions/edit?token=${encodeURIComponent(token)}">Request changes</a>`;
+  } else if (c.editable) {
+    actions = `<a class="edit-link" href="/commissions/edit?token=${encodeURIComponent(token)}">Edit</a>`;
+  }
   return `
       <tr data-status="${statusClass}">
         <td>
@@ -472,7 +669,7 @@ function commissionRowHtml(c) {
         </td>
         <td><span class="status-badge ${statusClass}">${escapeHtmlAttr(c.status)}</span></td>
         <td class="month">${escapeHtmlAttr(c.month)}</td>
-        <td>${editLink}</td>
+        <td class="row-actions">${actions}</td>
       </tr>`;
 }
 
@@ -482,6 +679,8 @@ const STATUS_FILTERS = [
   { key: 'status-preview-sent', label: 'Preview sent' },
   { key: 'status-changes-requested', label: 'Changes requested' },
   { key: 'status-approved', label: 'Approved' },
+  { key: 'status-needs-regeneration', label: 'Need regeneration' },
+  { key: 'status-ready-to-upload', label: 'Ready to upload' },
   { key: 'status-delivered', label: 'Delivered' }
 ];
 
@@ -696,6 +895,7 @@ app.post('/commissions/edit', upload.single('image'), async (req, res) => {
 
     await updateCommissionRow(decoded.month, decoded.rowNumber, { character, outfit, maleType, size, notes });
     await flagRowChangesRequested(fresh.tabGid, decoded.rowNumber);
+    notifyDiscord(`✏️ **${fresh.username}** requested changes on **${fresh.character}** (${decoded.month}).`);
 
     track('commission_edit_saved', { withImage: Boolean(req.file) });
     res.send(commissionsPageShell({
@@ -716,9 +916,382 @@ app.post('/commissions/edit', upload.single('image'), async (req, res) => {
   }
 });
 
+// One-click preview approval from the tracking page. Same defense stack as the edit
+// flow: signed token (month/row/username, TTL'd) + identity cookie must match the
+// row's username + fresh re-read must still be in "preview sent" — so a stale tab
+// can't approve a row whose status already moved on.
+app.post('/commissions/approve', async (req, res) => {
+  const fullName = identityCookieVerify(req.cookies.commission_identity);
+  if (!fullName) return res.redirect('/commissions');
+  const decoded = editTokenVerify(req.body.token);
+  if (!decoded) {
+    return res.status(403).send(commissionsPageShell({
+      title: 'Link expired',
+      bodyHtml: `
+    <h1>Link expired</h1>
+    <p>This approval link has expired. Refresh your commission list and try again.</p>
+    <div class="actions"><a class="btn btn-primary" href="/commissions">Back to commissions</a></div>`
+    }));
+  }
+  const fresh = await getFreshCommissionRow(decoded.month, decoded.rowNumber);
+  const stillPreview = fresh && statusBadgeClass(fresh.status) === 'status-preview-sent';
+  if (!fresh || fresh.username !== decoded.username || !isNameMatch(fullName, fresh.username) || !stillPreview) {
+    return res.status(403).send(commissionsPageShell({
+      title: "Can't approve this commission",
+      bodyHtml: `
+    <h1>Can't approve this commission</h1>
+    <p>This commission is not awaiting approval (its status may have changed). Refresh your commission list to see the current status.</p>
+    <div class="actions"><a class="btn btn-secondary" href="/commissions">Back to commissions</a></div>`
+    }));
+  }
+  try {
+    await setRowStatusByLabel(decoded.month, decoded.rowNumber, 'approved');
+    track('commission_approved');
+    notifyDiscord(`✅ **${fresh.username}** approved the preview for **${fresh.character}** (${decoded.month}).`);
+    res.send(commissionsPageShell({
+      title: 'Preview approved',
+      bodyHtml: `
+    <h1>Preview approved ✓</h1>
+    <p>Thanks! Full generation for <strong>${escapeHtmlAttr(fresh.character)}</strong> will start soon.</p>
+    <div class="actions"><a class="btn btn-primary" href="/commissions">Back to commissions</a></div>`
+    }));
+  } catch (err) {
+    console.error('Approve failed:', err.message || err);
+    track('commission_approve_failed');
+    res.status(500).send(commissionsPageShell({
+      title: 'Something went wrong',
+      bodyHtml: `
+    <h1>Something went wrong</h1>
+    <p>Your approval could not be saved. Please try again.</p>
+    <div class="actions"><a class="btn btn-primary" href="/commissions">Back to commissions</a></div>`
+    }));
+  }
+});
+
+// Mirrors the checkbox options on the live "commission form" Google Form exactly.
+const MALE_TYPE_OPTIONS = ['white male', 'black male', 'ugly bastards'];
+const SIZE_OPTIONS = ['Large (Default)', 'Medium/Average', 'Small', 'No preference'];
+
+function checkboxGroupHtml({ name, options, selected = [], otherChecked = false, otherText = '' }) {
+  const optionsHtml = options.map(opt => {
+    const checked = selected.includes(opt) ? ' checked' : '';
+    return `<label><input type="checkbox" name="${name}" value="${escapeHtmlAttr(opt)}"${checked}> ${escapeHtmlAttr(opt)}</label>`;
+  }).join('');
+  return `${optionsHtml}
+    <label><input type="checkbox" name="${name}Other" value="1"${otherChecked ? ' checked' : ''}> Other:
+      <input type="text" name="${name}OtherText" value="${escapeHtmlAttr(otherText)}"></label>`;
+}
+
+// Reads a `name` checkbox group (array if 2+ checked, plain string if exactly 1, absent
+// if none) plus its paired Other checkbox+text, joined the same way the sheet already
+// stores multi-select answers from the Google Form (comma-separated).
+function readCheckboxGroup(body, name) {
+  const raw = body[name];
+  const selected = Array.isArray(raw) ? raw : (raw ? [raw] : []);
+  const otherChecked = body[`${name}Other`] === '1';
+  const otherText = String(body[`${name}OtherText`] || '').trim().slice(0, 500);
+  const joined = [...selected, ...(otherChecked && otherText ? [otherText] : [])].join(', ');
+  return { selected, otherChecked, otherText, joined };
+}
+
+function commissionRequestFormHtml({ fullName, csrfToken, values = {}, error }) {
+  const errorHtml = error ? `<p class="form-error">${escapeHtmlAttr(error)}</p>` : '';
+  return commissionsPageShell({
+    title: 'Submit a commission',
+    maxWidth: '32rem',
+    bodyHtml: `
+    <h1>Submit a commission</h1>
+    <p>Submitting as <strong>${escapeHtmlAttr(fullName)}</strong> (detected from your Patreon login).</p>
+    ${errorHtml}
+    <form method="POST" action="/commissions/new" enctype="multipart/form-data" class="edit-form">
+      <input type="hidden" name="csrfToken" value="${escapeHtmlAttr(csrfToken)}">
+
+      <label for="character">What character do you want? *</label>
+      <p class="field-help">Please specify the Character Name and the Series/Source Material. If there are multiple versions of this character, please specify exactly which one you want.</p>
+      <textarea id="character" name="character" rows="2" required>${escapeHtmlAttr(values.character || '')}</textarea>
+
+      <label for="outfit">What outfit do you want them to wear? *</label>
+      <p class="field-help">Custom/alternate outfits are recommended over the default look — describe it in detail and include reference links (Pixiv or Booru) if you have any.</p>
+      <textarea id="outfit" name="outfit" rows="3" required>${escapeHtmlAttr(values.outfit || '')}</textarea>
+
+      <label for="images">Reference images (optional)</label>
+      <p class="field-help">Upload up to ${REFERENCE_IMAGE_LIMIT} images (PNG, JPEG, GIF, or WEBP, 8MB max each) instead of or alongside pasting links above.</p>
+      <input type="file" id="images" name="images" accept="image/png,image/jpeg,image/gif,image/webp" multiple>
+
+      <label>What type of male character do you prefer? *</label>
+      <p class="field-help">Male characters are generic, not specific named characters. For gangbang scenes the different male types can't be controlled individually. Lesbian and bestiality content isn't currently offered.</p>
+      <div class="checkbox-group">
+        ${checkboxGroupHtml({ name: 'maleType', options: MALE_TYPE_OPTIONS, selected: values.maleTypeSelected, otherChecked: values.maleTypeOtherChecked, otherText: values.maleTypeOtherText })}
+      </div>
+
+      <label>What size of penis would you prefer? (Optional)</label>
+      <p class="field-help">AI can be inconsistent with exact sizing. For specific genitalia requests (uncircumcised/smegma, condoms, pubic hair, etc.), use Other.</p>
+      <div class="checkbox-group">
+        ${checkboxGroupHtml({ name: 'size', options: SIZE_OPTIONS, selected: values.sizeSelected, otherChecked: values.sizeOtherChecked, otherText: values.sizeOtherText })}
+      </div>
+
+      <label for="notes">Any other specific requests? (Optional)</label>
+      <p class="field-help">Lighting, time of day, facial expressions, body proportions, etc. The standard poses included in every set can't be changed or removed, but extra poses can be requested here (include reference image links).</p>
+      <textarea id="notes" name="notes" rows="3">${escapeHtmlAttr(values.notes || '')}</textarea>
+
+      <label class="agree-check">
+        <input type="checkbox" name="agree" value="1" required>
+        <span>❗ I have read and agree to the commission rules ❗ — by checking this box I confirm I've read the latest guidelines and understand that failure to follow them may result in my commission being declined. <a href="https://www.patreon.com/posts/132896155" target="_blank" rel="noopener noreferrer">Read the full rules here</a>.</span>
+      </label>
+
+      <div class="actions">
+        <button type="submit" class="btn btn-primary">Submit commission</button>
+        <a class="btn btn-secondary" href="/">Cancel</a>
+      </div>
+    </form>`
+  });
+}
+
+app.get('/commissions/new', async (req, res) => {
+  const fullName = identityCookieVerify(req.cookies.commissioner_identity);
+  if (!fullName) {
+    track('page_commission_request_logged_out');
+    return res.send(commissionsPageShell({
+      title: 'Submit a commission',
+      bodyHtml: `
+    <h1>Submit a commission</h1>
+    <p>Log in with your commissioner-tier Patreon account to submit a new commission request.</p>
+    <div class="actions">
+      <a class="btn btn-primary" href="/login?intent=commission-request">Login to submit a commission</a>
+      <a class="btn btn-secondary" href="/">Back to home</a>
+    </div>`
+    }));
+  }
+  // Duplicate guard: one commission per month is the normal case, and a second row is
+  // usually an accident (double-click, "did it go through?" resubmit). Warn with an
+  // explicit escape hatch rather than blocking — multi-set patrons are a real thing.
+  if (req.query.anyway !== '1') {
+    try {
+      const existing = await findCommissionsForPatron(fullName);
+      const currentMonthRow = existing.find(c => statusBadgeClass(c.status) !== 'status-delivered'
+        && c.month.toLowerCase().includes(MONTH_NAMES_LOWER[new Date().getMonth()]));
+      if (currentMonthRow) {
+        track('page_commission_request_duplicate_warned');
+        return res.send(commissionsPageShell({
+          title: 'You already have a commission this month',
+          bodyHtml: `
+    <h1>Already submitted this month</h1>
+    <div class="dup-warn">You already have a commission in the ${escapeHtmlAttr(currentMonthRow.month)} tab:
+      <strong>${escapeHtmlAttr(currentMonthRow.character || 'Untitled')}</strong>
+      (status: ${escapeHtmlAttr(currentMonthRow.status)}).</div>
+    <p>If you want to change that commission, edit it instead of submitting a new one. Only submit another if you genuinely have more than one commission slot.</p>
+    <div class="actions">
+      <a class="btn btn-primary" href="/commissions">View / edit my commission</a>
+      <a class="btn btn-secondary" href="/commissions/new?anyway=1">Submit another anyway</a>
+    </div>`
+        }));
+      }
+    } catch (err) {
+      // The guard is best-effort — a sheet hiccup must not block the form itself.
+      console.error('Duplicate check failed (continuing to form):', err.message || err);
+    }
+  }
+  track('page_commission_request_viewed');
+  res.send(commissionRequestFormHtml({ fullName, csrfToken: issueCsrfToken(res, 'commission'), values: {}, error: null }));
+});
+
+app.post('/commissions/new', uploadReferenceImages.array('images', REFERENCE_IMAGE_LIMIT), async (req, res) => {
+  const fullName = identityCookieVerify(req.cookies.commissioner_identity);
+  if (!fullName) return res.redirect('/commissions/new');
+
+  if (!submitAllowed(rateLimitKeys(req, fullName))) {
+    track('commission_request_rate_limited');
+    return res.status(429).send(rateLimitedPage('/commissions/new'));
+  }
+
+  if (!verifyCsrfToken(req, 'commission')) {
+    return res.status(400).send(commissionsPageShell({
+      title: 'Session expired',
+      bodyHtml: `
+    <h1>Session expired</h1>
+    <p>Your form session expired. Please go back and try again.</p>
+    <div class="actions"><a class="btn btn-primary" href="/commissions/new">Back to form</a></div>`
+    }));
+  }
+
+  const character = String(req.body.character || '').trim().slice(0, 2000);
+  const outfit = String(req.body.outfit || '').trim().slice(0, 5000);
+  let notes = String(req.body.notes || '').trim().slice(0, 5000);
+  const agreed = req.body.agree === '1';
+  const maleType = readCheckboxGroup(req.body, 'maleType');
+  const size = readCheckboxGroup(req.body, 'size');
+
+  const values = {
+    character, outfit, notes,
+    maleTypeSelected: maleType.selected, maleTypeOtherChecked: maleType.otherChecked, maleTypeOtherText: maleType.otherText,
+    sizeSelected: size.selected, sizeOtherChecked: size.otherChecked, sizeOtherText: size.otherText
+  };
+
+  const fail = (status, error) =>
+    res.status(status).send(commissionRequestFormHtml({ fullName, csrfToken: issueCsrfToken(res, 'commission'), values, error }));
+
+  if (!agreed) return fail(400, 'You must agree to the commission rules to submit.');
+  if (!character) return fail(400, 'Character is required.');
+  if (!outfit) return fail(400, 'Outfit is required.');
+  if (!maleType.joined) return fail(400, 'Please select at least one male character preference.');
+
+  try {
+    if (req.files?.length) {
+      const imageUrls = await uploadReferenceImagesToCatbox(req.files);
+      const imageLines = imageUrls.map(url => `[Reference image: ${url}]`).join('\n');
+      notes = notes ? `${notes}\n${imageLines}` : imageLines;
+    }
+
+    const { month } = await appendCommissionSubmission({
+      username: fullName, character, outfit, maleType: maleType.joined, size: size.joined, notes
+    });
+    track('commission_request_submitted', { month, imageCount: req.files?.length || 0 });
+    notifyDiscord(`📝 New commission from **${fullName}**: **${character.slice(0, 120)}** — ${outfit.slice(0, 180)} (${month} tab)`);
+    res.send(commissionsPageShell({
+      title: 'Commission submitted',
+      bodyHtml: `
+    <h1>Commission submitted!</h1>
+    <p>Your commission request has been added to the ${escapeHtmlAttr(month)} tab. You can check its status any time on the commission tracking page.</p>
+    <div class="actions">
+      <a class="btn btn-primary" href="/commissions">View commission status</a>
+      <a class="btn btn-secondary" href="/">Back to home</a>
+    </div>`
+    }));
+  } catch (err) {
+    console.error('Commission submission failed:', err.response?.data || err.message || err);
+    track('commission_request_failed');
+    fail(500, 'Something went wrong submitting your commission. Please try again.');
+  }
+});
+
+function requestFormHtml({ fullName, csrfToken, values = {}, error }) {
+  const errorHtml = error ? `<p class="form-error">${escapeHtmlAttr(error)}</p>` : '';
+  const tier = values.tier || '';
+  return commissionsPageShell({
+    title: 'Submit a request',
+    maxWidth: '32rem',
+    bodyHtml: `
+    <h1>Submit a request</h1>
+    <p>Submitting as <strong>${escapeHtmlAttr(fullName)}</strong>.</p>
+    <p class="field-help">This is for requests, not commissions — ideas submitted here aren't guaranteed to be made. If you want the custom set that comes with your subscription, use "Submit a commission" instead.</p>
+    ${errorHtml}
+    <form method="POST" action="/requests/new" enctype="multipart/form-data" class="edit-form">
+      <input type="hidden" name="csrfToken" value="${escapeHtmlAttr(csrfToken)}">
+
+      <label>What tier are you subscribed to on Patreon? *</label>
+      <div class="checkbox-group">
+        <label><input type="radio" name="tier" value="Supporter (5 $)"${tier === 'Supporter (5 $)' ? ' checked' : ''} required> Supporter (5 $)</label>
+        <label><input type="radio" name="tier" value="Commissioner (11 $)"${tier === 'Commissioner (11 $)' ? ' checked' : ''}> Commissioner (11 $)</label>
+      </div>
+
+      <label for="character">What character/licence you'd want to see more of?</label>
+      <p class="field-help">If there are multiple versions of the character, please specify which one.</p>
+      <textarea id="character" name="character" rows="2">${escapeHtmlAttr(values.character || '')}</textarea>
+
+      <label for="outfit">Is there any kind of outfit you'd want to see more of?</label>
+      <p class="field-help">Describe in detail and provide an image reference if you have one.</p>
+      <textarea id="outfit" name="outfit" rows="3">${escapeHtmlAttr(values.outfit || '')}</textarea>
+
+      <label for="images">Reference images (optional)</label>
+      <p class="field-help">Upload up to ${REFERENCE_IMAGE_LIMIT} images (PNG, JPEG, GIF, or WEBP, 8MB max each).</p>
+      <input type="file" id="images" name="images" accept="image/png,image/jpeg,image/gif,image/webp" multiple>
+
+      <label for="notes">Is there anything else you'd want to see more of, or any feedback?</label>
+      <textarea id="notes" name="notes" rows="3">${escapeHtmlAttr(values.notes || '')}</textarea>
+
+      <label class="agree-check">
+        <input type="checkbox" name="agree" value="1" required>
+        <span>By checking this box, I understand that this is a request form, not a submission form, and that TGV9173 is not forced to follow any of the ideas I submitted.</span>
+      </label>
+
+      <div class="actions">
+        <button type="submit" class="btn btn-primary">Submit request</button>
+        <a class="btn btn-secondary" href="/">Cancel</a>
+      </div>
+    </form>`
+  });
+}
+
+app.get('/requests/new', (req, res) => {
+  const fullName = identityCookieVerify(req.cookies.commission_identity);
+  if (!fullName) {
+    track('page_request_form_logged_out');
+    return res.send(commissionsPageShell({
+      title: 'Submit a request',
+      bodyHtml: `
+    <h1>Submit a request</h1>
+    <p>Log in with Patreon to submit a character/outfit request or general feedback.</p>
+    <div class="actions">
+      <a class="btn btn-primary" href="/login?intent=requests">Login to submit a request</a>
+      <a class="btn btn-secondary" href="/">Back to home</a>
+    </div>`
+    }));
+  }
+  track('page_request_form_viewed');
+  res.send(requestFormHtml({ fullName, csrfToken: issueCsrfToken(res, 'request'), values: {}, error: null }));
+});
+
+app.post('/requests/new', uploadReferenceImages.array('images', REFERENCE_IMAGE_LIMIT), async (req, res) => {
+  const fullName = identityCookieVerify(req.cookies.commission_identity);
+  if (!fullName) return res.redirect('/requests/new');
+
+  if (!submitAllowed(rateLimitKeys(req, fullName))) {
+    track('request_rate_limited');
+    return res.status(429).send(rateLimitedPage('/requests/new'));
+  }
+
+  if (!verifyCsrfToken(req, 'request')) {
+    return res.status(400).send(commissionsPageShell({
+      title: 'Session expired',
+      bodyHtml: `
+    <h1>Session expired</h1>
+    <p>Your form session expired. Please go back and try again.</p>
+    <div class="actions"><a class="btn btn-primary" href="/requests/new">Back to form</a></div>`
+    }));
+  }
+
+  const tier = String(req.body.tier || '').trim().slice(0, 100);
+  const character = String(req.body.character || '').trim().slice(0, 2000);
+  const outfit = String(req.body.outfit || '').trim().slice(0, 5000);
+  let notes = String(req.body.notes || '').trim().slice(0, 5000);
+  const agreed = req.body.agree === '1';
+  const values = { tier, character, outfit, notes };
+
+  const fail = (status, error) =>
+    res.status(status).send(requestFormHtml({ fullName, csrfToken: issueCsrfToken(res, 'request'), values, error }));
+
+  if (!agreed) return fail(400, 'You must agree to the terms to submit.');
+  if (!tier) return fail(400, 'Please select your Patreon tier.');
+
+  try {
+    if (req.files?.length) {
+      const imageUrls = await uploadReferenceImagesToCatbox(req.files);
+      const imageLines = imageUrls.map(url => `[Reference image: ${url}]`).join('\n');
+      notes = notes ? `${notes}\n${imageLines}` : imageLines;
+    }
+
+    await appendRequestSubmission({ username: fullName, tier, character, outfit, notes });
+    track('request_submitted', { imageCount: req.files?.length || 0 });
+    notifyDiscord(`💡 New request from **${fullName}** (${tier}): ${(character || outfit || notes || 'see sheet').slice(0, 200)}`);
+    res.send(commissionsPageShell({
+      title: 'Request submitted',
+      bodyHtml: `
+    <h1>Request submitted!</h1>
+    <p>Thanks — your request has been sent to the creator.</p>
+    <div class="actions"><a class="btn btn-secondary" href="/">Back to home</a></div>`
+    }));
+  } catch (err) {
+    console.error('Request submission failed:', err.response?.data || err.message || err);
+    track('request_submission_failed');
+    fail(500, 'Something went wrong submitting your request. Please try again.');
+  }
+});
+
+const LOGIN_INTENTS = ['commissions', 'commission-request', 'requests'];
+
 app.get('/login', (req, res) => {
   const referer = req.get('Referer') || 'No referer';
-  const intent = req.query.intent === 'commissions' ? 'commissions' : 'default';
+  const intent = LOGIN_INTENTS.includes(req.query.intent) ? req.query.intent : 'default';
   track('login_started', { referer: referer === 'No referer' ? undefined : referer.slice(0, 500), intent });
   // State is HMAC-signed — verified on return without any cookie, so it survives mobile tab suspension,
   // cookie-blocking proxies, and server restarts (given OAUTH_STATE_SECRET env var is set).
@@ -734,9 +1307,14 @@ app.get('/login', (req, res) => {
   res.redirect(`https://www.patreon.com/oauth2/authorize?${params}`);
 });
 
-function errorPage({ status, title, body, retryHref }) {
+function errorPage({ status, title, body, retryHref, messageHref, messageLabel }) {
+  // When a "message the creator" CTA is present it's the recommended action, so it takes the
+  // primary button style and Try again (less likely to help) steps down to secondary.
   const retryMarkup = retryHref
-    ? `<a class="btn btn-primary" href="${escapeHtmlAttr(retryHref)}">Try again</a>`
+    ? `<a class="btn ${messageHref ? 'btn-secondary' : 'btn-primary'}" href="${escapeHtmlAttr(retryHref)}">Try again</a>`
+    : '';
+  const messageMarkup = messageHref
+    ? `<a class="btn btn-primary" href="${escapeHtmlAttr(messageHref)}" target="_blank" rel="noopener noreferrer">${escapeHtmlAttr(messageLabel || 'Message me on Patreon')}</a>`
     : '';
   return `<!DOCTYPE html>
 <html lang="en">
@@ -766,6 +1344,7 @@ function errorPage({ status, title, body, retryHref }) {
     <h1>${escapeHtmlAttr(title)}</h1>
     <p>${body}</p>
     <div class="actions">
+      ${messageMarkup}
       ${retryMarkup}
       <a class="btn btn-secondary" href="/">Back to home</a>
     </div>
@@ -848,7 +1427,7 @@ app.get('/callback', async (req, res) => {
 
     // Check HMAC-signed cache cookie — lets returning users bypass the identity API call
     // (token exchange above already proved Patreon authorized them; we're only caching the tier result)
-    // Skipped for the commissions intent: that flow needs full_name regardless of the cached tier result.
+    // Skipped for commissions/commission-request: both need full_name regardless of the cached tier result.
     const cachedUserId = intent === 'default' ? patronCookieVerify(req.cookies.patron_verified) : null;
     if (cachedUserId) {
       const cached = getCachedPatron(cachedUserId);
@@ -896,45 +1475,72 @@ app.get('/callback', async (req, res) => {
       })
     );
 
-    // Commission tracking just needs proof of Patreon identity, not a tier match —
-    // sign the name into a cookie and hand off to /commissions immediately.
-    if (intent === 'commissions') {
+    // Commission tracking and the request form both just need proof of Patreon
+    // identity, not a tier match — sign the name into a cookie and hand off. The
+    // 'requests' intent exists so a login started FROM the request form lands back on
+    // it, instead of dumping the user on the tracking page to navigate back by hand.
+    if (intent === 'commissions' || intent === 'requests') {
       const fullName = userRes.data?.data?.attributes?.full_name;
       res.clearCookie('login_referer', loginRefererCookieOptions());
       if (!fullName) {
         track('oauth_commissions_missing_name');
         return res.status(500).send(
-          errorPage({ title: 'Login error', body: 'Patreon did not return a name for your account. Please try again.', retryHref: '/login?intent=commissions' })
+          errorPage({ title: 'Login error', body: 'Patreon did not return a name for your account. Please try again.', retryHref: `/login?intent=${intent}` })
         );
       }
       res.cookie('commission_identity', identityCookieSign(fullName), identityCookieOptions());
-      track('oauth_commissions_success');
-      return res.redirect('/commissions');
+      track(intent === 'requests' ? 'oauth_requests_success' : 'oauth_commissions_success');
+      return res.redirect(intent === 'requests' ? '/requests/new' : '/commissions');
     }
 
-    const allowedTierIds = (process.env.ALLOWED_TIER_IDS || '')
-      .split(',')
-      .map(id => id.trim())
-      .filter(id => id);
-
-    const memberships = userRes.data.included || [];
-    let memberItems = memberships.filter(item => item.type === 'member');
-    if (PATREON_CAMPAIGN_ID) {
-      memberItems = memberItems.filter(
-        m => m.relationships?.campaign?.data?.id === PATREON_CAMPAIGN_ID
-      );
-      if (memberItems.length === 0) {
-        console.error(
-          'Tier check: no member row for PATREON_CAMPAIGN_ID',
-          PATREON_CAMPAIGN_ID,
-          '(wrong ID or patron not in this campaign)'
+    // Submitting a new paid commission needs BOTH proof of identity (to attribute the
+    // row) and a real tier check (a public URL isn't gated the way "shared only in the
+    // commissioner-tier Patreon chat" was) — checked against COMMISSIONER_TIER_IDS,
+    // deliberately a separate env var from ALLOWED_TIER_IDS since that one may allow
+    // broader tiers than just the one commissions are actually included with.
+    if (intent === 'commission-request') {
+      const fullName = userRes.data?.data?.attributes?.full_name;
+      res.clearCookie('login_referer', loginRefererCookieOptions());
+      if (!fullName) {
+        track('oauth_commission_request_missing_name');
+        return res.status(500).send(
+          errorPage({ title: 'Login error', body: 'Patreon did not return a name for your account. Please try again.', retryHref: '/login?intent=commission-request' })
         );
       }
+      const commissionerTierIds = parseTierIds(process.env.COMMISSIONER_TIER_IDS);
+      const { userTierIds } = extractPatreonMembership(userRes);
+      const matched = tierMatches(userTierIds, commissionerTierIds);
+      if (!matched) {
+        console.error('Commission-request tier check failed. User tier IDs:', userTierIds, 'Allowed COMMISSIONER_TIER_IDS:', commissionerTierIds);
+        track('oauth_commission_request_tier_denied', { entitledTierCount: userTierIds.length });
+        return res.status(403).send(
+          errorPage({
+            title: 'Access denied',
+            body: 'Submitting a new commission request requires the commissioner tier on Patreon. If you believe this is a mistake, make sure your payment is up to date on Patreon and try again.',
+            retryHref: '/login?intent=commission-request'
+          })
+        );
+      }
+      const signedIdentity = identityCookieSign(fullName);
+      res.cookie('commissioner_identity', signedIdentity, identityCookieOptions());
+      // Also sign them in for identity-only commission tracking — a verified commissioner
+      // is automatically eligible for that lower-stakes check too, saving a second login
+      // when they click through to view the commission they just submitted.
+      res.cookie('commission_identity', signedIdentity, identityCookieOptions());
+      track('oauth_commission_request_success');
+      return res.redirect('/commissions/new');
     }
-    const userTierIds = memberItems.flatMap(item =>
-      (item.relationships?.currently_entitled_tiers?.data || []).map(tier => tier.id)
-    );
 
+    const allowedTierIds = parseTierIds(process.env.ALLOWED_TIER_IDS);
+    const { memberItems, userTierIds } = extractPatreonMembership(userRes);
+    if (PATREON_CAMPAIGN_ID && memberItems.length === 0) {
+      console.error(
+        'Tier check: no member row for PATREON_CAMPAIGN_ID',
+        PATREON_CAMPAIGN_ID,
+        '(wrong ID or patron not in this campaign)'
+      );
+    }
+    const matched = tierMatches(userTierIds, allowedTierIds);
     const patreonUserId = userRes.data?.data?.id;
 
     // Per-user whitelist for patrons whose accounts trigger Patreon's identity API 504 bug
@@ -952,8 +1558,6 @@ app.get('/callback', async (req, res) => {
       res.clearCookie('login_referer', loginRefererCookieOptions());
       return res.redirect(SUCCESS_REDIRECT_URI);
     }
-
-    const matched = userTierIds.some(id => allowedTierIds.includes(id));
 
     // Cache the result and set signed cookie for future logins within 1 hour
     if (patreonUserId) {
@@ -1025,6 +1629,27 @@ app.get('/callback', async (req, res) => {
     }
 
     const isPatreonOverloaded = ax?.status === 504 || ax?.status === 503 || ax?.status === 502;
+
+    // Known Patreon-side bug: the identity endpoint (which pulls in every membership via
+    // include=memberships) can just stop responding for accounts subscribed to a lot of
+    // creators, instead of returning a normal error. Retrying won't fix it — it's on
+    // Patreon's end — so point the patron at a manual workaround instead of "try again".
+    if (err.patreonRequestLabel === 'Patreon identity') {
+      track('oauth_identity_unresponsive', {
+        httpStatus: ax?.status,
+        networkCode: err.code || undefined
+      });
+      return res.status(502).send(
+        errorPage({
+          title: "Couldn't verify your Patreon account",
+          body: `This looks like a known Patreon bug: if you're subscribed to a lot of creators, Patreon's servers sometimes fail to respond at all when we check your account. It isn't something wrong with your payment or this site, and retrying usually won't help.<br><br>Please send me a DM on Patreon so I can check your account manually. And if you'd like to help get this fixed for everyone, reporting it to Patreon support helps too.`,
+          retryHref: '/login',
+          messageHref: PATREON_PROFILE_URL,
+          messageLabel: 'Message me on Patreon'
+        })
+      );
+    }
+
     track('oauth_request_failed', {
       httpStatus: ax?.status,
       patreonOAuthError: oauthErr || undefined,
@@ -1042,20 +1667,34 @@ app.get('/callback', async (req, res) => {
   }
 });
 
-// Multer throws synchronously (file too large, wrong mimetype) before the route handler runs —
-// catch it here so uploads fail with a normal error page instead of a raw stack trace.
+// Multer throws synchronously (file too large, wrong mimetype, too many files) before the
+// route handler runs — catch it here so uploads fail with a normal error page instead of a
+// raw stack trace. Three different forms use multer now, so the "back" link and analytics
+// event depend on which path the upload came from.
+const UPLOAD_ROUTE_INFO = {
+  '/commissions/edit': { backHref: req => `/commissions/edit?token=${encodeURIComponent(req.body?.token || req.query?.token || '')}`, backLabel: 'Back to edit form', event: 'commission_edit_upload_rejected' },
+  '/commissions/new': { backHref: () => '/commissions/new', backLabel: 'Back to form', event: 'commission_request_upload_rejected' },
+  '/requests/new': { backHref: () => '/requests/new', backLabel: 'Back to form', event: 'request_upload_rejected' }
+};
+
 app.use((err, req, res, next) => {
   if (err instanceof multer.MulterError || err?.message?.includes('multipart')) {
     console.error('Upload error:', err.message);
-    track('commission_edit_upload_rejected', { code: err.code });
-    const token = req.body?.token || req.query?.token || '';
+    const routeInfo = UPLOAD_ROUTE_INFO[req.path] || UPLOAD_ROUTE_INFO['/commissions/edit'];
+    track(routeInfo.event, { code: err.code });
+
+    let message = 'That file could not be uploaded - please use a PNG, JPEG, GIF, or WEBP image.';
+    if (err.code === 'LIMIT_FILE_SIZE') message = 'That image is too large (8MB max).';
+    else if (err.invalidType) message = 'One of the files is not a supported image type - please use PNG, JPEG, GIF, or WEBP.';
+    else if (err.code === 'LIMIT_FILE_COUNT' || err.code === 'LIMIT_UNEXPECTED_FILE') message = `Too many images - ${REFERENCE_IMAGE_LIMIT} max.`;
+
     return res.status(400).send(commissionsPageShell({
       title: 'Upload failed',
       bodyHtml: `
     <h1>Upload failed</h1>
-    <p>${err.code === 'LIMIT_FILE_SIZE' ? 'That image is too large (8MB max).' : 'That file could not be uploaded - please use a PNG, JPEG, GIF, or WEBP image.'}</p>
+    <p>${message}</p>
     <div class="actions">
-      <a class="btn btn-primary" href="/commissions/edit?token=${encodeURIComponent(token)}">Back to edit form</a>
+      <a class="btn btn-primary" href="${escapeHtmlAttr(routeInfo.backHref(req))}">${escapeHtmlAttr(routeInfo.backLabel)}</a>
       <a class="btn btn-secondary" href="/commissions">Back to commissions</a>
     </div>`
     }));
