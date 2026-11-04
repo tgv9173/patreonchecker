@@ -1403,6 +1403,21 @@ const LIB_CSS = `
   .set-name { font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .set-series { color: #667085; font-size: .8rem; flex-shrink: 0; }
   .set-date { color: #98a2b3; font-size: .75rem; flex-shrink: 0; margin-left: auto; }
+  .set-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+    gap: .8rem; margin-top: .6rem; }
+  .set-card { position: relative; background: #fff; border-radius: .6rem;
+    overflow: hidden; box-shadow: 0 1px 4px rgba(0,0,0,.08); }
+  .set-card .card-link { display: block; color: #1a1a1a; }
+  .set-card img { width: 100%; aspect-ratio: 3/4; object-fit: cover; display: block;
+    background: #e4e7ec; }
+  .set-card .no-thumb { display: block; width: 100%; aspect-ratio: 3/4; background: #e4e7ec; }
+  .set-card .card-name { display: block; padding: .45rem .6rem 0; font-weight: 500;
+    font-size: .85rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .set-card .card-series { display: block; padding: 0 .6rem; color: #667085;
+    font-size: .75rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .set-card .card-date { display: block; padding: 0 .6rem .5rem; color: #98a2b3; font-size: .72rem; }
+  .set-card .like { position: absolute; top: .3rem; right: .3rem;
+    background: rgba(255,255,255,.85); border-radius: 2rem; }
   .like { border: 0; background: none; cursor: pointer; color: #98a2b3;
     font-size: .95rem; padding: .2rem .3rem; flex-shrink: 0; }
   .like.liked, .like:hover { color: #e0245e; }
@@ -1461,9 +1476,9 @@ function galleryPage({ title, setKey, slides, setLiked, setLikeCount, likedImage
     const liked = likedImages.has(s.key);
     const count = imageLikeCounts.get(s.key) || 0;
     return `<div class="row">` +
-      `<a href="${escapeHtmlAttr(s.url)}" class="glightbox t" data-gallery="set">` +
-      `<img src="${escapeHtmlAttr(s.url)}" loading="lazy" alt="${escapeHtmlAttr(s.name)}"></a>` +
-      `<span class="name">${escapeHtmlAttr(s.name)}</span>` +
+      `<a href="${escapeHtmlAttr(s.url)}" class="glightbox rowlink" data-gallery="set">` +
+      `<img class="t" src="${escapeHtmlAttr(s.url)}" loading="lazy" alt="${escapeHtmlAttr(s.name)}">` +
+      `<span class="name">${escapeHtmlAttr(s.name)}</span></a>` +
       likeBtn('image', s.key, liked, count) +
       `<a class="dl" href="${escapeHtmlAttr(s.dl)}" title="Download">⬇</a>` +
       `</div>`;
@@ -1487,8 +1502,9 @@ function galleryPage({ title, setKey, slides, setLiked, setLikeCount, likedImage
     .list { display: flex; flex-direction: column; padding: 0 .4rem; }
     .row { display: flex; align-items: center; gap: .6rem; padding: .3rem .2rem;
       border-bottom: 1px solid #222; }
-    .row a.t { width: 52px; height: 52px; flex-shrink: 0; border-radius: 6px; overflow: hidden; background: #222; }
-    .row a.t img { width: 100%; height: 100%; object-fit: cover; display: block; }
+    .rowlink { flex: 1; display: flex; align-items: center; gap: .6rem; min-width: 0; }
+    .rowlink img.t { width: 52px; height: 52px; flex-shrink: 0; border-radius: 6px;
+      object-fit: cover; display: block; background: #222; }
     .row .name { flex: 1; font-size: .82rem; color: #aaa; overflow: hidden;
       text-overflow: ellipsis; white-space: nowrap; }
     .like { border: 0; background: none; cursor: pointer; color: #98a2b3; font-size: .95rem; padding: .25rem .3rem; }
@@ -1655,15 +1671,16 @@ app.get('/library', async (req, res) => {
         (activePills.length ? `<a class="clear" href="/library">✕ ${activePills.join(' · ')}</a>` : '') +
         `</form>`;
     };
-    const setRow = (s) => {
+    const setCard = (s) => {
       const thumb = s.cover
-        ? `<img class="thumb" loading="lazy" src="${escapeHtmlAttr(presignGet(s.cover, 3600))}" alt="">` : '';
-      return `<div class="set-row">` +
-        `<a class="set-link" href="/library?prefix=${encodeURIComponent(s.key + '/')}">` +
+        ? `<img loading="lazy" src="${escapeHtmlAttr(presignGet(s.cover, 3600))}" alt="">`
+        : `<span class="no-thumb"></span>`;
+      return `<div class="set-card">` +
+        `<a class="card-link" href="/library?prefix=${encodeURIComponent(s.key + '/')}">` +
         thumb +
-        `<span class="set-name">${escapeHtmlAttr(s.short)}</span>` +
-        (s.meta && s.meta.series ? `<span class="set-series">${escapeHtmlAttr(s.meta.series)}</span>` : '') +
-        (s.lastModified ? `<span class="set-date">${escapeHtmlAttr(s.lastModified.slice(0, 10))}</span>` : '') +
+        `<span class="card-name">${escapeHtmlAttr(s.short)}</span>` +
+        (s.meta && s.meta.series ? `<span class="card-series">${escapeHtmlAttr(s.meta.series)}</span>` : '') +
+        (s.lastModified ? `<span class="card-date">${escapeHtmlAttr(s.lastModified.slice(0, 10))}</span>` : '') +
         `</a>` +
         likeBtn('set', s.key, myLikes.has(s.key), likeCount.get(s.key) || 0) +
         `</div>`;
@@ -1689,7 +1706,7 @@ app.get('/library', async (req, res) => {
           headExtra: LIB_CSS,
           body: `<h1>Library <span class="muted">(${sets.length} sets)</span></h1>` +
             filterBar() +
-            `<div class="set-list">${sets.map(setRow).join('\n') || '<p class="muted">No set matches.</p>'}</div>` +
+            `<div class="set-grid">${sets.map(setCard).join('\n') || '<p class="muted">No set matches.</p>'}</div>` +
             LIKE_JS
         }));
       }
@@ -1703,13 +1720,14 @@ app.get('/library', async (req, res) => {
         `</a></div>`).join('\n');
       const looseRows = loose.map(f => {
         const name = f.replace(/\/$/, '');
-        return setRow({ key: name, short: name, meta: meta.get(name), cover: meta.get(name)?.coverKey, lastModified: meta.get(name)?.lastModified });
+        return setCard({ key: name, short: name, meta: meta.get(name), cover: meta.get(name)?.coverKey, lastModified: meta.get(name)?.lastModified });
       }).join('\n');
       return res.send(libraryPage({
         title: 'Library',
         headExtra: LIB_CSS,
         body: `<h1>Library</h1>` + filterBar() +
-          `<div class="set-list">${monthRows}${looseRows || ''}</div>` +
+          `<div class="set-list">${monthRows}</div>` +
+          (looseRows ? `<div class="set-grid">${looseRows}</div>` : '') +
           LIKE_JS
       }));
     }
@@ -1742,7 +1760,7 @@ app.get('/library', async (req, res) => {
         headExtra: LIB_CSS,
         body: `<h1>📁 ${escapeHtmlAttr(prefix.replace(/\/$/, ''))} <span class="muted">(${sets.length} sets)</span></h1>` +
           filterBar() + backLink +
-          `<div class="set-list">${sets.map(setRow).join('\n') || '<p class="muted">No set here yet.</p>'}</div>` +
+          `<div class="set-grid">${sets.map(setCard).join('\n') || '<p class="muted">No set here yet.</p>'}</div>` +
           LIKE_JS
       }));
     }
