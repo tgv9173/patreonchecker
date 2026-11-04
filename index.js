@@ -1382,19 +1382,27 @@ function likeBtn(kind, key, liked, count) {
 }
 
 const LIB_CSS = `
-  .search { margin: 0 0 .8rem; }
-  .search input { width: 100%; padding: .5rem .7rem; border: 1px solid #d0d5dd;
-    border-radius: .5rem; font-size: 1rem; box-sizing: border-box; }
-  .chips { margin: .3rem 0 .6rem; font-size: .85rem; }
-  .chip { display: inline-block; background: #eef2f6; border-radius: 1rem;
-    padding: .1rem .6rem; margin: .15rem .2rem 0 0; color: #344054; }
-  a.chip:hover { background: #dbe4ee; }
-  .chip.active { background: #175cd3; color: #fff; }
-  .set-card { position: relative; }
+  .filterbar { display: flex; flex-wrap: wrap; gap: .4rem; margin: 0 0 1rem;
+    align-items: center; position: sticky; top: 0; background: #f6f7f9;
+    padding: .5rem 0; z-index: 10; }
+  .filterbar input[type="search"] { flex: 1 1 12rem; padding: .45rem .7rem;
+    border: 1px solid #d0d5dd; border-radius: .5rem; font-size: .95rem; }
+  .filterbar select, .filterbar button { padding: .45rem .6rem; font-size: .9rem;
+    border: 1px solid #d0d5dd; border-radius: .5rem; background: #fff; max-width: 11rem; }
+  .filterbar button { background: #175cd3; color: #fff; border-color: #175cd3; cursor: pointer; }
+  .filterbar .clear { font-size: .85rem; color: #b42318; white-space: nowrap; }
+  .set-list { display: flex; flex-direction: column; }
+  .set-row { display: flex; align-items: center; gap: .5rem; padding: .35rem .2rem;
+    border-bottom: 1px solid #eaecf0; min-height: 2.4rem; }
+  .set-row:hover { background: #eef2f6; }
+  .set-link { flex: 1; display: flex; align-items: baseline; gap: .6rem;
+    min-width: 0; color: #1a1a1a; }
+  .set-name { font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .set-series { color: #667085; font-size: .8rem; flex-shrink: 0; }
   .like { border: 0; background: none; cursor: pointer; color: #98a2b3;
-    font-size: .95rem; padding: .2rem .3rem; }
+    font-size: .95rem; padding: .2rem .3rem; flex-shrink: 0; }
   .like.liked, .like:hover { color: #e0245e; }
-  .series { color: #667085; font-size: .82rem; }
+  .muted { font-weight: 400; }
 `;
 
 const LIKE_JS = `<script>
@@ -1456,6 +1464,9 @@ function galleryPage({ title, setKey, slides, setLiked, setLikeCount, likedImage
       `<a class="dl" href="${escapeHtmlAttr(s.dl)}" title="Download">⬇</a>` +
       `</div></div>`;
   }).join('\n');
+  const slidesJson = JSON.stringify(
+    slides.map(s => ({ key: s.key, dl: s.dl, liked: likedImages.has(s.key), n: imageLikeCounts.get(s.key) || 0 }))
+  ).replace(/</g, '\\u003c');
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -1477,6 +1488,13 @@ function galleryPage({ title, setKey, slides, setLiked, setLikeCount, likedImage
     .like { border: 0; background: none; cursor: pointer; color: #98a2b3; font-size: .95rem; padding: .25rem .3rem; }
     .like.liked, .like:hover { color: #e0245e; }
     a.dl { color: #9ecbff; text-decoration: none; font-size: 1rem; padding: .25rem .3rem; }
+    /* viewer overlay actions */
+    #lbActions { position: fixed; left: 50%; bottom: 1.2rem; transform: translateX(-50%);
+      display: none; gap: .8rem; z-index: 1000000; }
+    #lbActions button, #lbActions a { border: 0; border-radius: 2rem; padding: .55rem 1.1rem;
+      font-size: 1rem; cursor: pointer; text-decoration: none;
+      background: rgba(30,30,30,.85); color: #eee; backdrop-filter: blur(4px); }
+    #lbActions button.liked { color: #e0245e; }
   </style>
 </head>
 <body>
@@ -1487,9 +1505,42 @@ function galleryPage({ title, setKey, slides, setLiked, setLikeCount, likedImage
     <a class="zip" href="/library/zip?prefix=${encodeURIComponent(setKey + '/')}">⬇ all (.zip)</a>
   </header>
   <div class="grid">${cards}</div>
+  <div id="lbActions">
+    <button id="lbLike" type="button">♥ <span class="n">0</span></button>
+    <a id="lbDl" href="#" title="Download">⬇</a>
+  </div>
   <script src="/vendor/glightbox/js/glightbox.min.js"></script>
   <script>
-    GLightbox({ selector: '.glightbox', touchNavigation: true, zoomable: true, loop: true });
+    const SLIDES = ${slidesJson};
+    const lb = GLightbox({ selector: '.glightbox', touchNavigation: true, zoomable: true, loop: true });
+    const actions = document.getElementById('lbActions');
+    const likeBtnEl = document.getElementById('lbLike');
+    const dlEl = document.getElementById('lbDl');
+    function currentSlide() { return SLIDES[lb.getActiveSlideIndex()]; }
+    function refreshActions() {
+      const s = currentSlide();
+      if (!s) return;
+      likeBtnEl.classList.toggle('liked', s.liked);
+      likeBtnEl.querySelector('.n').textContent = s.n;
+      dlEl.href = s.dl;
+    }
+    lb.on('open', () => { actions.style.display = 'flex'; refreshActions(); });
+    lb.on('close', () => { actions.style.display = 'none'; });
+    lb.on('slide_changed', refreshActions);
+    likeBtnEl.addEventListener('click', async () => {
+      const s = currentSlide();
+      if (!s) return;
+      try {
+        const r = await fetch('/library/like', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ kind: 'image', key: s.key })
+        });
+        if (!r.ok) return;
+        const d = await r.json();
+        s.liked = d.liked; s.n = d.count;
+        refreshActions();
+      } catch (e) {}
+    });
   </script>
   ${LIKE_JS}
 </body>
@@ -1552,6 +1603,7 @@ app.get('/library', async (req, res) => {
       const q = String(req.query.q || '').trim().toLowerCase();
       const tagF = String(req.query.tag || '').trim().toLowerCase();
       const seriesF = String(req.query.series || '').trim();
+      const sort = String(req.query.sort || 'name');
       const tagSet = new Set();
       const seriesSet = new Set();
       for (const m of meta.values()) {
@@ -1568,37 +1620,41 @@ app.get('/library', async (req, res) => {
         s.meta.tags.some(t => t.includes(q)));
       if (tagF) sets = sets.filter(s => s.meta.tags.includes(tagF));
       if (seriesF) sets = sets.filter(s => s.meta.series === seriesF);
-      const cards = sets.map(s => {
-        const chips = s.meta.tags.slice(0, 4)
-          .map(t => `<span class="chip">${escapeHtmlAttr(t)}</span>`).join('');
-        const series = s.meta.series
-          ? `<span class="series">${escapeHtmlAttr(s.meta.series)}</span>` : '';
-        return `<div class="set-card">` +
-          `<a class="set" href="/library?prefix=${encodeURIComponent(s.name + '/')}">` +
-          `<strong>${escapeHtmlAttr(s.name)}</strong><br>${series}</a>` +
-          `<div class="chips">${chips}</div>` +
-          likeBtn('set', s.name, myLikes.has(s.name), likeCount.get(s.name) || 0) +
-          `</div>`;
-      }).join('\n');
-      const tagChips = [...tagSet].sort().map(t =>
-        `<a class="chip${t === tagF ? ' active' : ''}" href="/library?tag=${encodeURIComponent(t)}">${escapeHtmlAttr(t)}</a>`
-      ).join('');
-      const seriesChips = [...seriesSet].sort().map(s =>
-        `<a class="chip${s === seriesF ? ' active' : ''}" href="/library?series=${encodeURIComponent(s)}">${escapeHtmlAttr(s)}</a>`
-      ).join('');
-      const clear = (q || tagF || seriesF)
-        ? `<a class="chip" href="/library">✕ clear filters</a>` : '';
+      sets.sort(sort === 'likes'
+        ? (a, b) => (likeCount.get(b.name) || 0) - (likeCount.get(a.name) || 0) || a.name.localeCompare(b.name)
+        : (a, b) => a.name.localeCompare(b.name));
+      const rows = sets.map(s =>
+        `<div class="set-row">` +
+        `<a class="set-link" href="/library?prefix=${encodeURIComponent(s.name + '/')}">` +
+        `<span class="set-name">${escapeHtmlAttr(s.name)}</span>` +
+        (s.meta.series ? `<span class="set-series">${escapeHtmlAttr(s.meta.series)}</span>` : '') +
+        `</a>` +
+        likeBtn('set', s.name, myLikes.has(s.name), likeCount.get(s.name) || 0) +
+        `</div>`
+      ).join('\n');
+      const opts = (list, cur) => list.map(v =>
+        `<option value="${escapeHtmlAttr(v)}"${v === cur ? ' selected' : ''}>${escapeHtmlAttr(v)}</option>`).join('');
+      const activePills = [
+        q && `q="${escapeHtmlAttr(String(req.query.q))}"`,
+        seriesF && `series: ${escapeHtmlAttr(seriesF)}`,
+        tagF && `tag: ${escapeHtmlAttr(tagF)}`
+      ].filter(Boolean);
       return res.send(libraryPage({
         title: 'Library',
         headExtra: LIB_CSS,
-        body: `<h1>Library</h1>` +
-          `<form method="get" action="/library" class="search">` +
-          `<input type="search" name="q" value="${escapeHtmlAttr(String(req.query.q || ''))}" placeholder="Search sets, characters, tags…">` +
+        body: `<h1>Library <span class="muted">(${sets.length} sets)</span></h1>` +
+          `<form method="get" action="/library" class="filterbar">` +
+          `<input type="search" name="q" value="${escapeHtmlAttr(String(req.query.q || ''))}" placeholder="Search…">` +
+          `<select name="series"><option value="">All series</option>${opts([...seriesSet].sort(), seriesF)}</select>` +
+          `<select name="tag"><option value="">All tags</option>${opts([...tagSet].sort(), tagF)}</select>` +
+          `<select name="sort">` +
+          `<option value="name"${sort === 'name' ? ' selected' : ''}>Name</option>` +
+          `<option value="likes"${sort === 'likes' ? ' selected' : ''}>Most liked</option>` +
+          `</select>` +
+          `<button type="submit">Filter</button>` +
+          (activePills.length ? `<a class="clear" href="/library">✕ ${activePills.join(' · ')}</a>` : '') +
           `</form>` +
-          (seriesChips ? `<div class="chips"><strong>Series:</strong> ${seriesChips}</div>` : '') +
-          (tagChips ? `<div class="chips"><strong>Tags:</strong> ${tagChips}</div>` : '') +
-          clear +
-          `<div class="sets">${cards || '<p class="muted">No set matches.</p>'}</div>` +
+          `<div class="set-list">${rows || '<p class="muted">No set matches.</p>'}</div>` +
           LIKE_JS
       }));
     }
