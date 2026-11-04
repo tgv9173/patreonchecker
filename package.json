@@ -16,5 +16,8 @@
     "googleapis": "^173.0.0",
     "multer": "^2.2.0",
     "querystring": "^0.2.1"
+  },
+  "overrides": {
+    "qs": "^6.17.1"
   }
 }
