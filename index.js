@@ -1398,6 +1398,42 @@ function libraryPage({ title, body }) {
 </html>`;
 }
 
+// Full-screen gallery for a set: thumbnail grid + GLightbox (MIT) for
+// swipe / pinch-zoom on mobile. Slides are presigned R2 URLs, so image
+// bytes flow straight from Cloudflare to the patron's browser.
+function galleryPage({ title, slides }) {
+  const items = slides.map((s, i) =>
+    `<a href="${escapeHtmlAttr(s.url)}" class="glightbox" data-gallery="set">` +
+    `<img src="${escapeHtmlAttr(s.url)}" loading="lazy" alt="${escapeHtmlAttr(s.name)}"></a>`
+  ).join('\n');
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>${escapeHtmlAttr(title)}</title>
+  <link rel="stylesheet" href="/vendor/glightbox/css/glightbox.min.css">
+  <style>
+    body { margin: 0; font-family: system-ui, sans-serif; background: #111; color: #eee; }
+    header { padding: .8rem 1rem; display: flex; align-items: baseline; gap: 1rem; }
+    h1 { font-size: 1.1rem; margin: 0; }
+    a.back { color: #9ecbff; text-decoration: none; font-size: .9rem; }
+    .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(140px, 1fr)); gap: 4px; padding: 4px; }
+    .grid a { display: block; aspect-ratio: 3/4; overflow: hidden; background: #222; }
+    .grid img { width: 100%; height: 100%; object-fit: cover; display: block; }
+  </style>
+</head>
+<body>
+  <header><a class="back" href="/library">← Library</a><h1>${escapeHtmlAttr(title)}</h1></header>
+  <div class="grid">${items}</div>
+  <script src="/vendor/glightbox/js/glightbox.min.js"></script>
+  <script>
+    GLightbox({ selector: '.glightbox', touchNavigation: true, zoomable: true, loop: true });
+  </script>
+</body>
+</html>`;
+}
+
 // Dev-only shortcut for UI testing (phone on zerotier, etc.): sets a valid
 // patron_verified cookie without the Patreon OAuth round-trip. Enabled ONLY
 // when DEV_BYPASS=1 is set in the environment — never set it in production.
@@ -1458,18 +1494,13 @@ app.get('/library', async (req, res) => {
         body: `<h1>Library</h1><div class="sets">${cards}</div>`
       }));
     }
-    const files = keys
+    const slides = keys
       .filter(k => !k.key.endsWith('/'))
-      .map(k => {
-        const name = k.key.slice(prefix.length);
-        return `<a href="/library/file?key=${encodeURIComponent(k.key)}">${escapeHtmlAttr(name)}</a>`;
-      }).join('\n');
+      .map(k => ({ name: k.key.slice(prefix.length), url: presignGet(k.key, 3600) }));
     const setName = escapeHtmlAttr(prefix.replace(/\/$/, ''));
-    return res.send(libraryPage({
+    return res.send(galleryPage({
       title: setName,
-      body: `<h1><a href="/library">Library</a> / ${setName}</h1>` +
-        `<p class="muted">${keys.length} files — links expire after 15 minutes, just click again if one lapses.</p>` +
-        `<div class="files">${files || '<span class="muted">No files here.</span>'}</div>`
+      slides
     }));
   } catch (err) {
     console.error('R2 list failed:', err.response ? { status: err.response.status, data: String(err.response.data).slice(0, 300) } : err.message);
@@ -1942,6 +1973,12 @@ app.use((err, req, res, next) => {
 });
 
 const port = process.env.PORT || 3000;
+// Static vendor assets for the gallery viewer (GLightbox, MIT).
+app.use('/vendor/glightbox', express.static(
+  path.join(__dirname, 'node_modules', 'glightbox', 'dist'),
+  { maxAge: '7d', immutable: true }
+));
+
 // --- AList proxy (optional) -------------------------------------------------
 // When ALIST_URL is set (e.g. http://127.0.0.1:5244), every request that did
 // not match a route above is proxied to the AList instance serving the R2
