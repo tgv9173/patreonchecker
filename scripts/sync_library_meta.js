@@ -30,6 +30,16 @@ function cleanTags(raw) {
     .filter(t => t && t.length > 1 && !t.includes(' '));
 }
 
+// "(Kai'sa:1.3)" / "mordred \(fate\)" -> "Kai'Sa" / "Mordred (Fate)"
+function cleanSeries(raw) {
+  let s = String(raw || '').trim();
+  // strip weight suffixes "(name:1.3)" -> "(name)" then unwrap single outer parens
+  s = s.replace(/:\d+(\.\d+)?/g, '');
+  s = s.replace(/\\\(/g, '(').replace(/\\\)/g, ')');
+  s = s.replace(/^\((.*)\)$/, '$1');
+  return titleCase(s.replace(/_/g, ' ').trim());
+}
+
 async function main() {
   const files = fs.readdirSync(SPECS_DIR).filter(f => f.endsWith('_spec.json'));
   let synced = 0;
@@ -39,7 +49,7 @@ async function main() {
     catch { continue; }
     const setKey = f.replace(/_spec\.json$/, '');
     const [charPart, ...copyParts] = String(spec.character_tag || '').split(',').map(s => s.trim());
-    const series = charPart ? titleCase(charPart.replace(/_/g, ' ')) : null;
+    const series = charPart ? cleanSeries(charPart) : null;
     const tags = new Set([...copyParts.map(t => t.toLowerCase()), ...cleanTags(spec.style_tags)]);
     dbLib.upsertMeta(setKey, series, [...tags]);
     synced++;
@@ -47,11 +57,13 @@ async function main() {
   console.log(`synced ${synced} specs from ${SPECS_DIR}`);
 
   // Register R2 sets that have no spec (empty meta — they stay searchable by name).
+  // Month folders (YYYY-MM/) are not sets; skip them.
   if (r2Configured()) {
     const { prefixes } = await listObjects({});
     const meta = dbLib.allMeta();
     let added = 0;
     for (const p of prefixes) {
+      if (/^\d{4}-\d{2}\/$/.test(p)) continue;
       const key = p.replace(/\/$/, '');
       if (!meta.has(key)) { dbLib.upsertMeta(key, null, []); added++; }
     }

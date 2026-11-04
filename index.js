@@ -1697,8 +1697,9 @@ app.get('/library', async (req, res) => {
       track('library_browse', { patronId, prefix: '(root)' });
       if (filtersActive) {
         // Global search across every scanned/synced set.
-        let sets = [...meta.entries()].map(([key, m]) => ({
-          key, short: key.split('/').pop(), meta: m, cover: m.coverKey, lastModified: m.lastModified
+        let sets = [...meta.entries()].map(([short, m]) => ({
+          key: m.month ? `${m.month}/${short}` : short,
+          short, meta: m, cover: m.coverKey, lastModified: m.lastModified
         })).filter(matchesFilters);
         sets.sort(sorter);
         return res.send(libraryPage({
@@ -1749,7 +1750,7 @@ app.get('/library', async (req, res) => {
       }
       let sets = [...bySet.values()];
       for (const s of sets) {
-        s.meta = meta.get(s.key);
+        s.meta = meta.get(s.short);
         dbLib.upsertScan(s.key, prefix.replace(/\/$/, ''), s.cover, s.lastModified);
       }
       sets = sets.filter(matchesFilters);
