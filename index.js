@@ -10,6 +10,7 @@ const multer = require('multer');
 
 const { track, TRACK_HOME } = require('./analytics');
 const { r2Configured, presignGet, listObjects } = require('./lib/r2');
+const dbLib = require('./lib/db');
 const {
   isNameMatch,
   findCommissionsForPatron,
@@ -1371,7 +1372,48 @@ const LOGIN_INTENTS = ['commissions', 'commission-request', 'requests'];
 // URLs generated on click — no long-lived public link exists anywhere.
 // ---------------------------------------------------------------------------
 
-function libraryPage({ title, body }) {
+// --- Library extras: likes, search, series/tags -----------------------------
+
+// Heart toggle button; wired by LIKE_JS on the client.
+function likeBtn(kind, key, liked, count) {
+  return `<button type="button" class="like${liked ? ' liked' : ''}" ` +
+    `data-kind="${kind}" data-key="${escapeHtmlAttr(key)}" ` +
+    `onclick="toggleLike(this)" title="Like">♥ <span class="n">${count}</span></button>`;
+}
+
+const LIB_CSS = `
+  .search { margin: 0 0 .8rem; }
+  .search input { width: 100%; padding: .5rem .7rem; border: 1px solid #d0d5dd;
+    border-radius: .5rem; font-size: 1rem; box-sizing: border-box; }
+  .chips { margin: .3rem 0 .6rem; font-size: .85rem; }
+  .chip { display: inline-block; background: #eef2f6; border-radius: 1rem;
+    padding: .1rem .6rem; margin: .15rem .2rem 0 0; color: #344054; }
+  a.chip:hover { background: #dbe4ee; }
+  .chip.active { background: #175cd3; color: #fff; }
+  .set-card { position: relative; }
+  .like { border: 0; background: none; cursor: pointer; color: #98a2b3;
+    font-size: .95rem; padding: .2rem .3rem; }
+  .like.liked, .like:hover { color: #e0245e; }
+  .series { color: #667085; font-size: .82rem; }
+`;
+
+const LIKE_JS = `<script>
+async function toggleLike(btn) {
+  try {
+    const r = await fetch('/library/like', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ kind: btn.dataset.kind, key: btn.dataset.key })
+    });
+    if (!r.ok) return;
+    const d = await r.json();
+    btn.classList.toggle('liked', d.liked);
+    btn.querySelector('.n').textContent = d.count;
+  } catch (e) { /* network hiccup — leave the UI as-is */ }
+}
+</script>`;
+
+function libraryPage({ title, body, headExtra = '' }) {
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -1392,6 +1434,7 @@ function libraryPage({ title, body }) {
     .files { columns: 2 20rem; }
     .files a { display: block; padding: .15rem 0; overflow-wrap: anywhere; }
     .muted { color: #667085; font-size: .9rem; }
+    ${headExtra}
   </style>
 </head>
 <body><main>${body}</main></body>
@@ -1401,11 +1444,18 @@ function libraryPage({ title, body }) {
 // Full-screen gallery for a set: thumbnail grid + GLightbox (MIT) for
 // swipe / pinch-zoom on mobile. Slides are presigned R2 URLs, so image
 // bytes flow straight from Cloudflare to the patron's browser.
-function galleryPage({ title, slides }) {
-  const items = slides.map((s, i) =>
-    `<a href="${escapeHtmlAttr(s.url)}" class="glightbox" data-gallery="set">` +
-    `<img src="${escapeHtmlAttr(s.url)}" loading="lazy" alt="${escapeHtmlAttr(s.name)}"></a>`
-  ).join('\n');
+function galleryPage({ title, setKey, slides, setLiked, setLikeCount, likedImages, imageLikeCounts }) {
+  const cards = slides.map(s => {
+    const liked = likedImages.has(s.key);
+    const count = imageLikeCounts.get(s.key) || 0;
+    return `<div class="card">` +
+      `<a href="${escapeHtmlAttr(s.url)}" class="glightbox" data-gallery="set">` +
+      `<img src="${escapeHtmlAttr(s.url)}" loading="lazy" alt="${escapeHtmlAttr(s.name)}"></a>` +
+      `<div class="bar">` +
+      likeBtn('image', s.key, liked, count) +
+      `<a class="dl" href="${escapeHtmlAttr(s.dl)}" title="Download">⬇</a>` +
+      `</div></div>`;
+  }).join('\n');
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -1415,21 +1465,33 @@ function galleryPage({ title, slides }) {
   <link rel="stylesheet" href="/vendor/glightbox/css/glightbox.min.css">
   <style>
     body { margin: 0; font-family: system-ui, sans-serif; background: #111; color: #eee; }
-    header { padding: .8rem 1rem; display: flex; align-items: baseline; gap: 1rem; }
-    h1 { font-size: 1.1rem; margin: 0; }
+    header { padding: .8rem 1rem; display: flex; align-items: center; gap: 1rem; flex-wrap: wrap; }
+    h1 { font-size: 1.1rem; margin: 0; flex: 1; }
     a.back { color: #9ecbff; text-decoration: none; font-size: .9rem; }
+    a.zip { color: #ffd479; text-decoration: none; font-size: .9rem; }
     .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(140px, 1fr)); gap: 4px; padding: 4px; }
-    .grid a { display: block; aspect-ratio: 3/4; overflow: hidden; background: #222; }
-    .grid img { width: 100%; height: 100%; object-fit: cover; display: block; }
+    .card { background: #1c1c1c; border-radius: 4px; overflow: hidden; }
+    .card > a { display: block; aspect-ratio: 3/4; overflow: hidden; }
+    .card img { width: 100%; height: 100%; object-fit: cover; display: block; }
+    .bar { display: flex; justify-content: space-between; align-items: center; padding: 0 .3rem; }
+    .like { border: 0; background: none; cursor: pointer; color: #98a2b3; font-size: .95rem; padding: .25rem .3rem; }
+    .like.liked, .like:hover { color: #e0245e; }
+    a.dl { color: #9ecbff; text-decoration: none; font-size: 1rem; padding: .25rem .3rem; }
   </style>
 </head>
 <body>
-  <header><a class="back" href="/library">← Library</a><h1>${escapeHtmlAttr(title)}</h1></header>
-  <div class="grid">${items}</div>
+  <header>
+    <a class="back" href="/library">← Library</a>
+    <h1>${title}</h1>
+    ${likeBtn('set', setKey, setLiked, setLikeCount)}
+    <a class="zip" href="/library/zip?prefix=${encodeURIComponent(setKey + '/')}">⬇ all (.zip)</a>
+  </header>
+  <div class="grid">${cards}</div>
   <script src="/vendor/glightbox/js/glightbox.min.js"></script>
   <script>
     GLightbox({ selector: '.glightbox', touchNavigation: true, zoomable: true, loop: true });
   </script>
+  ${LIKE_JS}
 </body>
 </html>`;
 }
@@ -1484,23 +1546,79 @@ app.get('/library', async (req, res) => {
       }));
     }
     if (!prefix) {
-      const cards = prefixes.map(p => {
+      const meta = dbLib.allMeta();
+      const likeCount = dbLib.likeCounts('set');
+      const myLikes = dbLib.likedSet(patronId, 'set');
+      const q = String(req.query.q || '').trim().toLowerCase();
+      const tagF = String(req.query.tag || '').trim().toLowerCase();
+      const seriesF = String(req.query.series || '').trim();
+      const tagSet = new Set();
+      const seriesSet = new Set();
+      for (const m of meta.values()) {
+        if (m.series) seriesSet.add(m.series);
+        for (const t of m.tags) tagSet.add(t);
+      }
+      let sets = prefixes.map(p => {
         const name = p.replace(/\/$/, '');
-        return `<a class="set" href="/library?prefix=${encodeURIComponent(p)}">` +
-          `<strong>${escapeHtmlAttr(name)}</strong></a>`;
+        return { name, meta: meta.get(name) || { series: null, tags: [] } };
+      });
+      if (q) sets = sets.filter(s =>
+        s.name.toLowerCase().includes(q) ||
+        (s.meta.series || '').toLowerCase().includes(q) ||
+        s.meta.tags.some(t => t.includes(q)));
+      if (tagF) sets = sets.filter(s => s.meta.tags.includes(tagF));
+      if (seriesF) sets = sets.filter(s => s.meta.series === seriesF);
+      const cards = sets.map(s => {
+        const chips = s.meta.tags.slice(0, 4)
+          .map(t => `<span class="chip">${escapeHtmlAttr(t)}</span>`).join('');
+        const series = s.meta.series
+          ? `<span class="series">${escapeHtmlAttr(s.meta.series)}</span>` : '';
+        return `<div class="set-card">` +
+          `<a class="set" href="/library?prefix=${encodeURIComponent(s.name + '/')}">` +
+          `<strong>${escapeHtmlAttr(s.name)}</strong><br>${series}</a>` +
+          `<div class="chips">${chips}</div>` +
+          likeBtn('set', s.name, myLikes.has(s.name), likeCount.get(s.name) || 0) +
+          `</div>`;
       }).join('\n');
+      const tagChips = [...tagSet].sort().map(t =>
+        `<a class="chip${t === tagF ? ' active' : ''}" href="/library?tag=${encodeURIComponent(t)}">${escapeHtmlAttr(t)}</a>`
+      ).join('');
+      const seriesChips = [...seriesSet].sort().map(s =>
+        `<a class="chip${s === seriesF ? ' active' : ''}" href="/library?series=${encodeURIComponent(s)}">${escapeHtmlAttr(s)}</a>`
+      ).join('');
+      const clear = (q || tagF || seriesF)
+        ? `<a class="chip" href="/library">✕ clear filters</a>` : '';
       return res.send(libraryPage({
         title: 'Library',
-        body: `<h1>Library</h1><div class="sets">${cards}</div>`
+        headExtra: LIB_CSS,
+        body: `<h1>Library</h1>` +
+          `<form method="get" action="/library" class="search">` +
+          `<input type="search" name="q" value="${escapeHtmlAttr(String(req.query.q || ''))}" placeholder="Search sets, characters, tags…">` +
+          `</form>` +
+          (seriesChips ? `<div class="chips"><strong>Series:</strong> ${seriesChips}</div>` : '') +
+          (tagChips ? `<div class="chips"><strong>Tags:</strong> ${tagChips}</div>` : '') +
+          clear +
+          `<div class="sets">${cards || '<p class="muted">No set matches.</p>'}</div>` +
+          LIKE_JS
       }));
     }
     const slides = keys
       .filter(k => !k.key.endsWith('/'))
-      .map(k => ({ name: k.key.slice(prefix.length), url: presignGet(k.key, 3600) }));
-    const setName = escapeHtmlAttr(prefix.replace(/\/$/, ''));
+      .map(k => ({
+        name: k.key.slice(prefix.length),
+        key: k.key,
+        url: presignGet(k.key, 3600),
+        dl: presignGet(k.key, 3600, { download: true })
+      }));
+    const setKey = prefix.replace(/\/$/, '');
     return res.send(galleryPage({
-      title: setName,
-      slides
+      title: escapeHtmlAttr(setKey),
+      setKey,
+      slides,
+      setLiked: dbLib.likedSet(patronId, 'set').has(setKey),
+      setLikeCount: dbLib.likeCounts('set').get(setKey) || 0,
+      likedImages: dbLib.likedSet(patronId, 'image'),
+      imageLikeCounts: dbLib.likeCounts('image')
     }));
   } catch (err) {
     console.error('R2 list failed:', err.response ? { status: err.response.status, data: String(err.response.data).slice(0, 300) } : err.message);
@@ -1520,8 +1638,76 @@ app.get('/library/file', async (req, res) => {
   if (!key || key.includes('..') || key.startsWith('/')) {
     return res.status(400).send(errorPage({ title: 'Invalid path', body: 'Invalid file path.' }));
   }
+  const download = req.query.download === '1';
   track('library_download', { patronId, key });
-  res.redirect(302, presignGet(key, 900));
+  res.redirect(302, presignGet(key, 900, { download }));
+});
+
+// Toggle a like on a set or an image. Body: { kind: 'set'|'image', key }.
+app.post('/library/like', express.json(), (req, res) => {
+  const patronId = patronCookieVerify(req.cookies.patron_verified);
+  if (!patronId) return res.status(401).json({ error: 'unauthorized' });
+  const { kind, key } = req.body || {};
+  try {
+    const result = dbLib.toggleLike(String(patronId), String(kind), String(key));
+    track('library_like', { patronId, kind, liked: result.liked });
+    res.json(result);
+  } catch {
+    res.status(400).json({ error: 'bad request' });
+  }
+});
+
+// Stream a whole set as a zip. Files are pulled from R2 on the fly with
+// presigned URLs and piped straight into the archive (no disk buffering).
+// Note: a 200-image set is a few hundred MB and takes minutes — the
+// connection stays open and streams progressively.
+app.get('/library/zip', async (req, res) => {
+  if (!r2Configured()) return res.status(501).end();
+  const patronId = patronCookieVerify(req.cookies.patron_verified);
+  if (!patronId) return res.redirect('/login');
+  const prefix = String(req.query.prefix || '');
+  if (!prefix || prefix.includes('..') || prefix.startsWith('/')) {
+    return res.status(400).send(errorPage({ title: 'Invalid path', body: 'Invalid set path.' }));
+  }
+  const setName = prefix.replace(/\/$/, '') || 'set';
+  try {
+    const { keys } = await listObjects({ prefix, delimiter: '' });
+    const files = keys.filter(k => !k.key.endsWith('/'));
+    if (!files.length) {
+      return res.status(404).send(errorPage({ title: 'Empty set', body: 'No files in this set.' }));
+    }
+    track('library_zip', { patronId, prefix, files: files.length });
+    const archiver = require('archiver');
+    const https = require('https');
+    res.setHeader('Content-Type', 'application/zip');
+    res.setHeader('Content-Disposition',
+      `attachment; filename*=UTF-8''${encodeURIComponent(setName)}.zip`);
+    const archive = archiver('zip', { store: true });
+    archive.on('error', err => { console.error('zip error:', err.message); res.destroy(err); });
+    archive.pipe(res);
+    for (const f of files) {
+      const url = presignGet(f.key, 600);
+      const stream = await new Promise((resolve, reject) => {
+        https.get(url, r => {
+          if (r.statusCode !== 200) return reject(new Error(`R2 ${r.statusCode} on ${f.key}`));
+          resolve(r);
+        }).on('error', reject);
+      });
+      archive.append(stream, { name: f.key.slice(prefix.length) });
+      await new Promise((resolve, reject) => {
+        stream.on('end', resolve);
+        stream.on('error', reject);
+      });
+    }
+    await archive.finalize();
+  } catch (err) {
+    console.error('zip failed:', err.message);
+    if (!res.headersSent) {
+      res.status(502).send(errorPage({ title: 'Zip failed', body: 'Could not build the archive. Try again.' }));
+    } else {
+      res.destroy();
+    }
+  }
 });
 
 app.get('/login', (req, res) => {
