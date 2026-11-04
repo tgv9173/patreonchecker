@@ -283,6 +283,75 @@ function tierMatches(userTierIds, allowedTierIds) {
   return userTierIds.some(id => allowedTierIds.includes(id));
 }
 
+// ---------------------------------------------------------------------------
+// Creator-side membership lookup (fix for the identity truncation bug).
+//
+// Problem: the /identity endpoint caps the `included` memberships array, so
+// patrons with MANY pledges to other creators get their list cut before our
+// campaign's row — extractPatreonMembership() then finds nothing and they're
+// wrongly denied. Patreon offers no pagination on that include (confirmed on
+// the dev forum, topics 11362/11400; the June-2026 504 variant was fixed
+// server-side, the truncation was not).
+//
+// Fix: keep /identity minimal (it never truncates `data`), and check the
+// membership where it can't be truncated — creator-side, via the campaign
+// members endpoint with the Creator Access Token, which DOES paginate.
+// Requires two env vars on Render:
+//   PATREON_CAMPAIGN_ID          (already used by the user-side filter)
+//   PATREON_CREATOR_ACCESS_TOKEN (Creator Access Token from the dev portal)
+// Without the token the behaviour is unchanged (user-side check only).
+// ---------------------------------------------------------------------------
+const CREATOR_MEMBERS_CACHE_TTL_MS = 10 * 60 * 1000; // 10 min
+const creatorMembersCache = { at: 0, map: new Map() }; // patreonUserId -> tier ids
+
+async function getCreatorSideTierIds(patreonUserId) {
+  const token = (process.env.PATREON_CREATOR_ACCESS_TOKEN || '').trim();
+  if (!token || !PATREON_CAMPAIGN_ID || !patreonUserId) return null; // feature off
+  if (Date.now() - creatorMembersCache.at < CREATOR_MEMBERS_CACHE_TTL_MS &&
+      creatorMembersCache.map.size > 0) {
+    return creatorMembersCache.map.get(patreonUserId) || [];
+  }
+  const map = new Map();
+  let url = `https://www.patreon.com/api/oauth2/v2/campaigns/${PATREON_CAMPAIGN_ID}/members?` +
+    querystring.stringify({
+      include: 'user,currently_entitled_tiers',
+      'fields[member]': 'patron_status',
+      'page[count]': 200
+    });
+  let pages = 0;
+  while (url && pages < 50) {
+    const page = await patreonRequest('Patreon campaign members', () =>
+      axios.get(url, {
+        timeout: PATREON_HTTP_TIMEOUT_MS,
+        headers: {
+          Authorization: `Bearer ${token}`,
+          Accept: 'application/vnd.api+json',
+          'User-Agent': PATREON_API_USER_AGENT
+        }
+      })
+    );
+    const users = new Map(
+      (page.data.included || [])
+        .filter(i => i.type === 'user')
+        .map(i => [i.id, i])
+    );
+    for (const m of page.data.data || []) {
+      const uid = m.relationships?.user?.data?.id;
+      if (!uid || !users.has(uid)) continue;
+      // Only members in good standing count (active paid, or free followers if
+      // the tier list ever includes a free tier — patron_status null for declined).
+      const status = m.attributes?.patron_status;
+      if (status !== 'active_patron') continue;
+      map.set(uid, (m.relationships?.currently_entitled_tiers?.data || []).map(t => t.id));
+    }
+    url = page.data.links?.next || null;
+    pages += 1;
+  }
+  creatorMembersCache.at = Date.now();
+  creatorMembersCache.map = map;
+  return map.get(patreonUserId) || [];
+}
+
 /** Retries Patreon HTTP calls on timeouts / 502–504 (common when their edge is slow). */
 async function patreonRequest(label, axiosCall) {
   const maxAttempts = RETRY_BACKOFFS_MS.length + 1;
@@ -1509,7 +1578,21 @@ app.get('/callback', async (req, res) => {
       }
       const commissionerTierIds = parseTierIds(process.env.COMMISSIONER_TIER_IDS);
       const { userTierIds } = extractPatreonMembership(userRes);
-      const matched = tierMatches(userTierIds, commissionerTierIds);
+      let matched = tierMatches(userTierIds, commissionerTierIds);
+      // Creator-side rescue for the identity truncation bug (see default flow).
+      if (!matched) {
+        const crUserId = userRes.data?.data?.id;
+        try {
+          const creatorTierIds = await getCreatorSideTierIds(crUserId);
+          if (creatorTierIds !== null) {
+            matched = tierMatches(creatorTierIds, commissionerTierIds);
+            if (matched) track('oauth_commission_request_rescued_creator_side', { patreonUserId: crUserId });
+          }
+        } catch (err) {
+          console.error('Creator-side member lookup failed (commission-request):',
+            err.response ? { status: err.response.status, data: err.response.data } : err.message);
+        }
+      }
       if (!matched) {
         console.error('Commission-request tier check failed. User tier IDs:', userTierIds, 'Allowed COMMISSIONER_TIER_IDS:', commissionerTierIds);
         track('oauth_commission_request_tier_denied', { entitledTierCount: userTierIds.length });
@@ -1537,11 +1620,32 @@ app.get('/callback', async (req, res) => {
       console.error(
         'Tier check: no member row for PATREON_CAMPAIGN_ID',
         PATREON_CAMPAIGN_ID,
-        '(wrong ID or patron not in this campaign)'
+        '(wrong ID, patron not in this campaign, or identity include truncated)'
       );
     }
-    const matched = tierMatches(userTierIds, allowedTierIds);
+    let matched = tierMatches(userTierIds, allowedTierIds);
     const patreonUserId = userRes.data?.data?.id;
+
+    // Creator-side rescue: when the user-side identity include was truncated
+    // (patrons with many pledges), check the membership via the campaign
+    // members endpoint instead — it paginates, so nothing is lost.
+    if (!matched && patreonUserId) {
+      try {
+        const creatorTierIds = await getCreatorSideTierIds(patreonUserId);
+        if (creatorTierIds !== null) {
+          matched = tierMatches(creatorTierIds, allowedTierIds);
+          if (matched) {
+            track('oauth_tier_rescued_creator_side', { patreonUserId });
+          } else {
+            console.error('Creator-side check: user', patreonUserId,
+              'not an active patron of campaign', PATREON_CAMPAIGN_ID);
+          }
+        }
+      } catch (err) {
+        console.error('Creator-side member lookup failed (falling back to user-side result):',
+          err.response ? { status: err.response.status, data: err.response.data } : err.message);
+      }
+    }
 
     // Per-user whitelist for patrons whose accounts trigger Patreon's identity API 504 bug
     // (large pledge history causes currently_entitled_tiers to time out — Patreon bug June 2026).
