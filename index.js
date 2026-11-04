@@ -1395,10 +1395,14 @@ const LIB_CSS = `
   .set-row { display: flex; align-items: center; gap: .5rem; padding: .35rem .2rem;
     border-bottom: 1px solid #eaecf0; min-height: 2.4rem; }
   .set-row:hover { background: #eef2f6; }
-  .set-link { flex: 1; display: flex; align-items: baseline; gap: .6rem;
+  .set-link { flex: 1; display: flex; align-items: center; gap: .6rem;
     min-width: 0; color: #1a1a1a; }
+  .thumb { width: 48px; height: 48px; object-fit: cover; border-radius: 6px;
+    flex-shrink: 0; background: #e4e7ec; }
+  .month-row .set-name { font-weight: 600; }
   .set-name { font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .set-series { color: #667085; font-size: .8rem; flex-shrink: 0; }
+  .set-date { color: #98a2b3; font-size: .75rem; flex-shrink: 0; margin-left: auto; }
   .like { border: 0; background: none; cursor: pointer; color: #98a2b3;
     font-size: .95rem; padding: .2rem .3rem; flex-shrink: 0; }
   .like.liked, .like:hover { color: #e0245e; }
@@ -1456,13 +1460,13 @@ function galleryPage({ title, setKey, slides, setLiked, setLikeCount, likedImage
   const cards = slides.map(s => {
     const liked = likedImages.has(s.key);
     const count = imageLikeCounts.get(s.key) || 0;
-    return `<div class="card">` +
-      `<a href="${escapeHtmlAttr(s.url)}" class="glightbox" data-gallery="set">` +
+    return `<div class="row">` +
+      `<a href="${escapeHtmlAttr(s.url)}" class="glightbox t" data-gallery="set">` +
       `<img src="${escapeHtmlAttr(s.url)}" loading="lazy" alt="${escapeHtmlAttr(s.name)}"></a>` +
-      `<div class="bar">` +
+      `<span class="name">${escapeHtmlAttr(s.name)}</span>` +
       likeBtn('image', s.key, liked, count) +
       `<a class="dl" href="${escapeHtmlAttr(s.dl)}" title="Download">⬇</a>` +
-      `</div></div>`;
+      `</div>`;
   }).join('\n');
   const slidesJson = JSON.stringify(
     slides.map(s => ({ key: s.key, dl: s.dl, liked: likedImages.has(s.key), n: imageLikeCounts.get(s.key) || 0 }))
@@ -1480,11 +1484,13 @@ function galleryPage({ title, setKey, slides, setLiked, setLikeCount, likedImage
     h1 { font-size: 1.1rem; margin: 0; flex: 1; }
     a.back { color: #9ecbff; text-decoration: none; font-size: .9rem; }
     a.zip { color: #ffd479; text-decoration: none; font-size: .9rem; }
-    .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(140px, 1fr)); gap: 4px; padding: 4px; }
-    .card { background: #1c1c1c; border-radius: 4px; overflow: hidden; }
-    .card > a { display: block; aspect-ratio: 3/4; overflow: hidden; }
-    .card img { width: 100%; height: 100%; object-fit: cover; display: block; }
-    .bar { display: flex; justify-content: space-between; align-items: center; padding: 0 .3rem; }
+    .list { display: flex; flex-direction: column; padding: 0 .4rem; }
+    .row { display: flex; align-items: center; gap: .6rem; padding: .3rem .2rem;
+      border-bottom: 1px solid #222; }
+    .row a.t { width: 52px; height: 52px; flex-shrink: 0; border-radius: 6px; overflow: hidden; background: #222; }
+    .row a.t img { width: 100%; height: 100%; object-fit: cover; display: block; }
+    .row .name { flex: 1; font-size: .82rem; color: #aaa; overflow: hidden;
+      text-overflow: ellipsis; white-space: nowrap; }
     .like { border: 0; background: none; cursor: pointer; color: #98a2b3; font-size: .95rem; padding: .25rem .3rem; }
     .like.liked, .like:hover { color: #e0245e; }
     a.dl { color: #9ecbff; text-decoration: none; font-size: 1rem; padding: .25rem .3rem; }
@@ -1504,7 +1510,7 @@ function galleryPage({ title, setKey, slides, setLiked, setLikeCount, likedImage
     ${likeBtn('set', setKey, setLiked, setLikeCount)}
     <a class="zip" href="/library/zip?prefix=${encodeURIComponent(setKey + '/')}">⬇ all (.zip)</a>
   </header>
-  <div class="grid">${cards}</div>
+  <div class="list">${cards}</div>
   <div id="lbActions">
     <button id="lbLike" type="button">♥ <span class="n">0</span></button>
     <a id="lbDl" href="#" title="Download">⬇</a>
@@ -1588,77 +1594,162 @@ app.get('/library', async (req, res) => {
     return res.status(400).send(errorPage({ title: 'Invalid path', body: 'Invalid library path.' }));
   }
   try {
-    const { prefixes, keys } = await listObjects({ prefix });
-    track('library_browse', { patronId, prefix: prefix || '(root)' });
-    if (!prefix && prefixes.length === 0 && keys.length === 0) {
-      return res.send(libraryPage({
-        title: 'Library',
-        body: `<h1>Library</h1><p class="muted">The library is empty for now — check back later.</p>`
-      }));
+    // Paginated full listing of a prefix (all keys, any depth).
+    const listAll = async (p) => {
+      let keys = [], tok;
+      do {
+        const r = await listObjects({ prefix: p, delimiter: '', maxKeys: 1000, continuationToken: tok });
+        keys = keys.concat(r.keys);
+        tok = r.nextToken;
+      } while (tok);
+      return keys;
+    };
+
+    const meta = dbLib.allMeta();
+    const likeCount = dbLib.likeCounts('set');
+    const myLikes = dbLib.likedSet(patronId, 'set');
+    const q = String(req.query.q || '').trim().toLowerCase();
+    const tagF = String(req.query.tag || '').trim().toLowerCase();
+    const seriesF = String(req.query.series || '').trim();
+    const sort = String(req.query.sort || 'recent');
+    const filtersActive = Boolean(q || tagF || seriesF);
+
+    // Series/tag option lists with per-value set counts.
+    const seriesCount = new Map();
+    const tagCount = new Map();
+    for (const m of meta.values()) {
+      if (m.series) seriesCount.set(m.series, (seriesCount.get(m.series) || 0) + 1);
+      for (const t of m.tags) tagCount.set(t, (tagCount.get(t) || 0) + 1);
     }
-    if (!prefix) {
-      const meta = dbLib.allMeta();
-      const likeCount = dbLib.likeCounts('set');
-      const myLikes = dbLib.likedSet(patronId, 'set');
-      const q = String(req.query.q || '').trim().toLowerCase();
-      const tagF = String(req.query.tag || '').trim().toLowerCase();
-      const seriesF = String(req.query.series || '').trim();
-      const sort = String(req.query.sort || 'name');
-      const tagSet = new Set();
-      const seriesSet = new Set();
-      for (const m of meta.values()) {
-        if (m.series) seriesSet.add(m.series);
-        for (const t of m.tags) tagSet.add(t);
-      }
-      let sets = prefixes.map(p => {
-        const name = p.replace(/\/$/, '');
-        return { name, meta: meta.get(name) || { series: null, tags: [] } };
-      });
-      if (q) sets = sets.filter(s =>
-        s.name.toLowerCase().includes(q) ||
-        (s.meta.series || '').toLowerCase().includes(q) ||
-        s.meta.tags.some(t => t.includes(q)));
-      if (tagF) sets = sets.filter(s => s.meta.tags.includes(tagF));
-      if (seriesF) sets = sets.filter(s => s.meta.series === seriesF);
-      sets.sort(sort === 'likes'
-        ? (a, b) => (likeCount.get(b.name) || 0) - (likeCount.get(a.name) || 0) || a.name.localeCompare(b.name)
-        : (a, b) => a.name.localeCompare(b.name));
-      const rows = sets.map(s =>
-        `<div class="set-row">` +
-        `<a class="set-link" href="/library?prefix=${encodeURIComponent(s.name + '/')}">` +
-        `<span class="set-name">${escapeHtmlAttr(s.name)}</span>` +
-        (s.meta.series ? `<span class="set-series">${escapeHtmlAttr(s.meta.series)}</span>` : '') +
-        `</a>` +
-        likeBtn('set', s.name, myLikes.has(s.name), likeCount.get(s.name) || 0) +
-        `</div>`
-      ).join('\n');
-      const opts = (list, cur) => list.map(v =>
-        `<option value="${escapeHtmlAttr(v)}"${v === cur ? ' selected' : ''}>${escapeHtmlAttr(v)}</option>`).join('');
+    const optsWithCount = (countMap, cur) => [...countMap.keys()].sort()
+      .map(v => `<option value="${escapeHtmlAttr(v)}"${v === cur ? ' selected' : ''}>` +
+        `${escapeHtmlAttr(v)} (${countMap.get(v)})</option>`).join('');
+    const matchesFilters = (s) => {
+      const m = s.meta || { series: null, tags: [] };
+      if (q && !(s.short.toLowerCase().includes(q) ||
+          (m.series || '').toLowerCase().includes(q) || m.tags.some(t => t.includes(q)))) return false;
+      if (tagF && !m.tags.includes(tagF)) return false;
+      if (seriesF && m.series !== seriesF) return false;
+      return true;
+    };
+    const sorter = (a, b) =>
+      sort === 'likes' ? (likeCount.get(b.key) || 0) - (likeCount.get(a.key) || 0) || a.short.localeCompare(b.short)
+      : sort === 'name' ? a.short.localeCompare(b.short)
+      : String(b.lastModified || '').localeCompare(String(a.lastModified || ''));
+    const filterBar = () => {
       const activePills = [
         q && `q="${escapeHtmlAttr(String(req.query.q))}"`,
         seriesF && `series: ${escapeHtmlAttr(seriesF)}`,
         tagF && `tag: ${escapeHtmlAttr(tagF)}`
       ].filter(Boolean);
+      return `<form method="get" action="/library" class="filterbar">` +
+        `<input type="search" name="q" value="${escapeHtmlAttr(String(req.query.q || ''))}" placeholder="Search…">` +
+        `<select name="series"><option value="">All series</option>${optsWithCount(seriesCount, seriesF)}</select>` +
+        `<select name="tag"><option value="">All tags</option>${optsWithCount(tagCount, tagF)}</select>` +
+        `<select name="sort">` +
+        `<option value="recent"${sort === 'recent' ? ' selected' : ''}>Recent</option>` +
+        `<option value="name"${sort === 'name' ? ' selected' : ''}>Name</option>` +
+        `<option value="likes"${sort === 'likes' ? ' selected' : ''}>Most liked</option>` +
+        `</select>` +
+        `<button type="submit">Filter</button>` +
+        (activePills.length ? `<a class="clear" href="/library">✕ ${activePills.join(' · ')}</a>` : '') +
+        `</form>`;
+    };
+    const setRow = (s) => {
+      const thumb = s.cover
+        ? `<img class="thumb" loading="lazy" src="${escapeHtmlAttr(presignGet(s.cover, 3600))}" alt="">` : '';
+      return `<div class="set-row">` +
+        `<a class="set-link" href="/library?prefix=${encodeURIComponent(s.key + '/')}">` +
+        thumb +
+        `<span class="set-name">${escapeHtmlAttr(s.short)}</span>` +
+        (s.meta && s.meta.series ? `<span class="set-series">${escapeHtmlAttr(s.meta.series)}</span>` : '') +
+        (s.lastModified ? `<span class="set-date">${escapeHtmlAttr(s.lastModified.slice(0, 10))}</span>` : '') +
+        `</a>` +
+        likeBtn('set', s.key, myLikes.has(s.key), likeCount.get(s.key) || 0) +
+        `</div>`;
+    };
+
+    if (!prefix) {
+      const { prefixes: folders, keys: rootKeys } = await listObjects({});
+      if (!folders.length && !rootKeys.length) {
+        return res.send(libraryPage({
+          title: 'Library',
+          body: `<h1>Library</h1><p class="muted">The library is empty for now — check back later.</p>`
+        }));
+      }
+      track('library_browse', { patronId, prefix: '(root)' });
+      if (filtersActive) {
+        // Global search across every scanned/synced set.
+        let sets = [...meta.entries()].map(([key, m]) => ({
+          key, short: key.split('/').pop(), meta: m, cover: m.coverKey, lastModified: m.lastModified
+        })).filter(matchesFilters);
+        sets.sort(sorter);
+        return res.send(libraryPage({
+          title: 'Library',
+          headExtra: LIB_CSS,
+          body: `<h1>Library <span class="muted">(${sets.length} sets)</span></h1>` +
+            filterBar() +
+            `<div class="set-list">${sets.map(setRow).join('\n') || '<p class="muted">No set matches.</p>'}</div>` +
+            LIKE_JS
+        }));
+      }
+      // Month folders (YYYY-MM), newest first; anything else is a loose set.
+      const months = folders.filter(f => /^\d{4}-\d{2}\/$/.test(f)).sort().reverse();
+      const loose = folders.filter(f => !/^\d{4}-\d{2}\/$/.test(f));
+      const monthRows = months.map(m =>
+        `<div class="set-row month-row">` +
+        `<a class="set-link" href="/library?prefix=${encodeURIComponent(m)}">` +
+        `<span class="set-name">📁 ${escapeHtmlAttr(m.replace(/\/$/, ''))}</span>` +
+        `</a></div>`).join('\n');
+      const looseRows = loose.map(f => {
+        const name = f.replace(/\/$/, '');
+        return setRow({ key: name, short: name, meta: meta.get(name), cover: meta.get(name)?.coverKey, lastModified: meta.get(name)?.lastModified });
+      }).join('\n');
       return res.send(libraryPage({
         title: 'Library',
         headExtra: LIB_CSS,
-        body: `<h1>Library <span class="muted">(${sets.length} sets)</span></h1>` +
-          `<form method="get" action="/library" class="filterbar">` +
-          `<input type="search" name="q" value="${escapeHtmlAttr(String(req.query.q || ''))}" placeholder="Search…">` +
-          `<select name="series"><option value="">All series</option>${opts([...seriesSet].sort(), seriesF)}</select>` +
-          `<select name="tag"><option value="">All tags</option>${opts([...tagSet].sort(), tagF)}</select>` +
-          `<select name="sort">` +
-          `<option value="name"${sort === 'name' ? ' selected' : ''}>Name</option>` +
-          `<option value="likes"${sort === 'likes' ? ' selected' : ''}>Most liked</option>` +
-          `</select>` +
-          `<button type="submit">Filter</button>` +
-          (activePills.length ? `<a class="clear" href="/library">✕ ${activePills.join(' · ')}</a>` : '') +
-          `</form>` +
-          `<div class="set-list">${rows || '<p class="muted">No set matches.</p>'}</div>` +
+        body: `<h1>Library</h1>` + filterBar() +
+          `<div class="set-list">${monthRows}${looseRows || ''}</div>` +
           LIKE_JS
       }));
     }
-    const slides = keys
+
+    const { prefixes: sub } = await listObjects({ prefix });
+    track('library_browse', { patronId, prefix });
+    if (sub.length) {
+      // Folder of sets (a month): group keys by set, newest sets first.
+      const allKeys = await listAll(prefix);
+      const bySet = new Map();
+      for (const k of allKeys) {
+        const rel = k.key.slice(prefix.length);
+        if (!rel.includes('/')) continue;
+        const setName = rel.split('/')[0];
+        let s = bySet.get(setName);
+        if (!s) { s = { key: prefix + setName, short: setName, cover: k.key, lastModified: k.lastModified }; bySet.set(setName, s); }
+        if (k.key < s.cover) s.cover = k.key;
+        if (k.lastModified > s.lastModified) s.lastModified = k.lastModified;
+      }
+      let sets = [...bySet.values()];
+      for (const s of sets) {
+        s.meta = meta.get(s.key);
+        dbLib.upsertScan(s.key, prefix.replace(/\/$/, ''), s.cover, s.lastModified);
+      }
+      sets = sets.filter(matchesFilters);
+      sets.sort(sorter);
+      const backLink = `<p><a class="clear" href="/library">← All months</a></p>`;
+      return res.send(libraryPage({
+        title: prefix.replace(/\/$/, ''),
+        headExtra: LIB_CSS,
+        body: `<h1>📁 ${escapeHtmlAttr(prefix.replace(/\/$/, ''))} <span class="muted">(${sets.length} sets)</span></h1>` +
+          filterBar() + backLink +
+          `<div class="set-list">${sets.map(setRow).join('\n') || '<p class="muted">No set here yet.</p>'}</div>` +
+          LIKE_JS
+      }));
+    }
+
+    // A set: gallery view.
+    const allKeys = await listAll(prefix);
+    const slides = allKeys
       .filter(k => !k.key.endsWith('/'))
       .map(k => ({
         name: k.key.slice(prefix.length),
@@ -1668,7 +1759,7 @@ app.get('/library', async (req, res) => {
       }));
     const setKey = prefix.replace(/\/$/, '');
     return res.send(galleryPage({
-      title: escapeHtmlAttr(setKey),
+      title: escapeHtmlAttr(setKey.split('/').pop()),
       setKey,
       slides,
       setLiked: dbLib.likedSet(patronId, 'set').has(setKey),
