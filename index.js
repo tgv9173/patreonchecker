@@ -8,6 +8,7 @@ const fs = require('fs');
 const multer = require('multer');
 
 const { track, TRACK_HOME } = require('./analytics');
+const { r2Configured, presignGet, listObjects } = require('./lib/r2');
 const {
   isNameMatch,
   findCommissionsForPatron,
@@ -96,6 +97,9 @@ const CLIENT_SECRET = process.env.CLIENT_SECRET;
 const REDIRECT_URI = process.env.REDIRECT_URI || 'https://patreon-checker.onrender.com/callback';
 const ALLOWED_TIER_IDS = process.env.ALLOWED_TIER_IDS;
 const SUCCESS_REDIRECT_URI = process.env.SUCCESS_REDIRECT_URI;
+// When the R2 library is configured, oauth success lands on the gated library
+// instead of the (legacy, monthly-rotated) Dropbox link. See /library routes.
+const successTarget = () => (r2Configured() ? '/library' : SUCCESS_REDIRECT_URI);
 // Deliberately separate from ALLOWED_TIER_IDS above: that one gates the Dropbox-folder
 // link and may allow broader tiers, but only the commissioner tier actually gets a
 // commission with their subscription, so /commissions/new checks this instead.
@@ -1358,6 +1362,113 @@ app.post('/requests/new', uploadReferenceImages.array('images', REFERENCE_IMAGE_
 
 const LOGIN_INTENTS = ['commissions', 'commission-request', 'requests'];
 
+// ---------------------------------------------------------------------------
+// R2-backed library (replaces the monthly Dropbox link once R2_* env is set).
+// Access is the same patron_verified cookie the OAuth flow already sets, so a
+// lapsed subscriber loses access the moment their cached cookie expires (1h),
+// without any monthly link rotation. Download URLs are 15-min presigned R2
+// URLs generated on click — no long-lived public link exists anywhere.
+// ---------------------------------------------------------------------------
+
+function libraryPage({ title, body }) {
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  ${FAVICON_LINK_TAG}
+  <title>${escapeHtmlAttr(title)} - TGV9173</title>
+  <style>
+    :root { font-family: system-ui, sans-serif; line-height: 1.5; color: #1a1a1a; }
+    body { margin: 0; padding: 1.5rem; background: #f6f7f9; }
+    main { max-width: 56rem; margin: 0 auto; }
+    h1 { font-size: 1.25rem; }
+    a { color: #175cd3; text-decoration: none; }
+    .sets { display: grid; grid-template-columns: repeat(auto-fill, minmax(13rem, 1fr)); gap: .75rem; }
+    .set { background: #fff; border-radius: .5rem; padding: .8rem 1rem;
+      box-shadow: 0 1px 4px rgba(0,0,0,.07); display: block; }
+    .set .count { color: #667085; font-size: .85rem; }
+    .files { columns: 2 20rem; }
+    .files a { display: block; padding: .15rem 0; overflow-wrap: anywhere; }
+    .muted { color: #667085; font-size: .9rem; }
+  </style>
+</head>
+<body><main>${body}</main></body>
+</html>`;
+}
+
+app.get('/library', async (req, res) => {
+  if (!r2Configured()) {
+    return res.status(501).send(errorPage({
+      title: 'Not configured',
+      body: 'The library is not hosted here yet.'
+    }));
+  }
+  const patronId = patronCookieVerify(req.cookies.patron_verified);
+  if (!patronId) {
+    track('library_denied_no_cookie');
+    return res.redirect('/login');
+  }
+  const prefix = String(req.query.prefix || '');
+  // Path traversal guard: prefixes must stay inside the bucket root, no '..'.
+  if (prefix.includes('..') || prefix.startsWith('/')) {
+    return res.status(400).send(errorPage({ title: 'Invalid path', body: 'Invalid library path.' }));
+  }
+  try {
+    const { prefixes, keys } = await listObjects({ prefix });
+    track('library_browse', { patronId, prefix: prefix || '(root)' });
+    if (!prefix && prefixes.length === 0 && keys.length === 0) {
+      return res.send(libraryPage({
+        title: 'Library',
+        body: `<h1>Library</h1><p class="muted">The library is empty for now — check back later.</p>`
+      }));
+    }
+    if (!prefix) {
+      const cards = prefixes.map(p => {
+        const name = p.replace(/\/$/, '');
+        return `<a class="set" href="/library?prefix=${encodeURIComponent(p)}">` +
+          `<strong>${escapeHtmlAttr(name)}</strong></a>`;
+      }).join('\n');
+      return res.send(libraryPage({
+        title: 'Library',
+        body: `<h1>Library</h1><div class="sets">${cards}</div>`
+      }));
+    }
+    const files = keys
+      .filter(k => !k.key.endsWith('/'))
+      .map(k => {
+        const name = k.key.slice(prefix.length);
+        return `<a href="/library/file?key=${encodeURIComponent(k.key)}">${escapeHtmlAttr(name)}</a>`;
+      }).join('\n');
+    const setName = escapeHtmlAttr(prefix.replace(/\/$/, ''));
+    return res.send(libraryPage({
+      title: setName,
+      body: `<h1><a href="/library">Library</a> / ${setName}</h1>` +
+        `<p class="muted">${keys.length} files — links expire after 15 minutes, just click again if one lapses.</p>` +
+        `<div class="files">${files || '<span class="muted">No files here.</span>'}</div>`
+    }));
+  } catch (err) {
+    console.error('R2 list failed:', err.response ? { status: err.response.status, data: String(err.response.data).slice(0, 300) } : err.message);
+    track('library_error');
+    return res.status(502).send(errorPage({
+      title: 'Storage error',
+      body: 'The library storage did not answer correctly. Please try again in a moment.'
+    }));
+  }
+});
+
+app.get('/library/file', async (req, res) => {
+  if (!r2Configured()) return res.status(501).end();
+  const patronId = patronCookieVerify(req.cookies.patron_verified);
+  if (!patronId) return res.redirect('/login');
+  const key = String(req.query.key || '');
+  if (!key || key.includes('..') || key.startsWith('/')) {
+    return res.status(400).send(errorPage({ title: 'Invalid path', body: 'Invalid file path.' }));
+  }
+  track('library_download', { patronId, key });
+  res.redirect(302, presignGet(key, 900));
+});
+
 app.get('/login', (req, res) => {
   const referer = req.get('Referer') || 'No referer';
   const intent = LOGIN_INTENTS.includes(req.query.intent) ? req.query.intent : 'default';
@@ -1503,14 +1614,14 @@ app.get('/callback', async (req, res) => {
       if (cached) {
         res.clearCookie('login_referer', loginRefererCookieOptions());
         if (cached.matched) {
-          if (!SUCCESS_REDIRECT_URI) {
+          if (!successTarget()) {
             track('oauth_server_misconfigured', { missingEnv: 'SUCCESS_REDIRECT_URI' });
             return res.status(500).send(
               errorPage({ title: 'Server configuration error', body: 'Missing success redirect. Please contact the creator.' })
             );
           }
           track('oauth_success', { patreonUserId: cachedUserId, cached: true });
-          return res.redirect(SUCCESS_REDIRECT_URI);
+          return res.redirect(successTarget());
         } else {
           track('oauth_tier_denied', { patreonUserId: cachedUserId, cached: true });
           return res.status(403).send(
@@ -1660,7 +1771,7 @@ app.get('/callback', async (req, res) => {
       });
       track('oauth_success', { patreonUserId, whitelisted: true });
       res.clearCookie('login_referer', loginRefererCookieOptions());
-      return res.redirect(SUCCESS_REDIRECT_URI);
+      return res.redirect(successTarget());
     }
 
     // Cache the result and set signed cookie for future logins within 1 hour
@@ -1675,7 +1786,7 @@ app.get('/callback', async (req, res) => {
     }
 
     if (matched) {
-      if (!SUCCESS_REDIRECT_URI) {
+      if (!successTarget()) {
         console.error('SUCCESS_REDIRECT_URI is not set');
         track('oauth_server_misconfigured', { missingEnv: 'SUCCESS_REDIRECT_URI' });
         res.clearCookie('login_referer', loginRefererCookieOptions());
@@ -1685,7 +1796,7 @@ app.get('/callback', async (req, res) => {
       }
       track('oauth_success', { patreonUserId });
       res.clearCookie('login_referer', loginRefererCookieOptions());
-      res.redirect(SUCCESS_REDIRECT_URI);
+      res.redirect(successTarget());
     } else {
       console.error(
         'Access denied: tier mismatch. User tier IDs:',
