@@ -3,6 +3,7 @@ const axios = require('axios');
 const querystring = require('querystring');
 const cookieParser = require('cookie-parser');
 const crypto = require('crypto');
+const http = require('http');
 const path = require('path');
 const fs = require('fs');
 const multer = require('multer');
@@ -1412,6 +1413,15 @@ if (process.env.DEV_BYPASS === '1') {
 }
 
 app.get('/library', async (req, res) => {
+  const patronId0 = patronCookieVerify(req.cookies.patron_verified);
+  if (!patronId0) {
+    track('library_denied_no_cookie');
+    return res.redirect('/login');
+  }
+  if (ALIST_URL) {
+    // AList serves the library UI; the catch-all proxy below enforces auth.
+    return res.redirect('/sets');
+  }
   if (!r2Configured()) {
     return res.status(501).send(errorPage({
       title: 'Not configured',
@@ -1932,4 +1942,39 @@ app.use((err, req, res, next) => {
 });
 
 const port = process.env.PORT || 3000;
+// --- AList proxy (optional) -------------------------------------------------
+// When ALIST_URL is set (e.g. http://127.0.0.1:5244), every request that did
+// not match a route above is proxied to the AList instance serving the R2
+// bucket UI. AList's SPA uses absolute paths (/api, /d, /p, /assets), so this
+// must be a catch-all — auth (patron cookie) is enforced here, before any
+// byte reaches AList.
+const ALIST_URL = process.env.ALIST_URL || '';
+if (ALIST_URL) {
+  const alistTarget = new URL(ALIST_URL);
+  app.use((req, res) => {
+    const patronId = patronCookieVerify(req.cookies.patron_verified);
+    if (!patronId) {
+      track('alist_proxy_denied_no_cookie');
+      if (req.method !== 'GET') return res.status(401).end();
+      return res.redirect('/login');
+    }
+    const proxy = http.request({
+      hostname: alistTarget.hostname,
+      port: alistTarget.port,
+      path: req.originalUrl,
+      method: req.method,
+      headers: { ...req.headers, host: alistTarget.host }
+    }, (pres) => {
+      res.writeHead(pres.statusCode, pres.headers);
+      pres.pipe(res);
+    });
+    proxy.on('error', (err) => {
+      console.error('AList proxy error:', err.message);
+      if (!res.headersSent) res.status(502).end('Library UI unreachable.');
+    });
+    req.pipe(proxy);
+  });
+  console.log(`📚 AList proxy enabled → ${ALIST_URL}`);
+}
+
 app.listen(port, () => console.log(`✅ Server running on port ${port}`));
