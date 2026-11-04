@@ -1397,6 +1397,20 @@ function libraryPage({ title, body }) {
 </html>`;
 }
 
+// Dev-only shortcut for UI testing (phone on zerotier, etc.): sets a valid
+// patron_verified cookie without the Patreon OAuth round-trip. Enabled ONLY
+// when DEV_BYPASS=1 is set in the environment — never set it in production.
+if (process.env.DEV_BYPASS === '1') {
+  app.get('/dev/fake-login', (req, res) => {
+    res.cookie('patron_verified', patronCookieSign('dev-user'), {
+      httpOnly: true, sameSite: 'lax',
+      secure: false, maxAge: AUTH_CACHE_TTL_MS
+    });
+    res.redirect('/library');
+  });
+  console.warn('⚠️  DEV_BYPASS=1 — /dev/fake-login is ENABLED, do not expose this build publicly');
+}
+
 app.get('/library', async (req, res) => {
   if (!r2Configured()) {
     return res.status(501).send(errorPage({
