@@ -1775,6 +1775,9 @@ app.get('/library', async (req, res) => {
     const slides = allKeys
       .filter(k => !k.key.endsWith('/') && /\.(png|jpe?g|webp|gif)$/i.test(k.key))
       .filter(k => !k.key.slice(prefix.length).split('/').includes('preview'))
+      // Natural order: img_2 before img_10 (numeric-aware compare).
+      .sort((a, b) => a.key.slice(prefix.length).localeCompare(
+        b.key.slice(prefix.length), undefined, { numeric: true, sensitivity: 'base' }))
       .map(k => ({
         name: k.key.slice(prefix.length),
         key: k.key,
@@ -1845,6 +1848,8 @@ app.get('/library/zip', async (req, res) => {
     const { keys } = await listObjects({ prefix, delimiter: '' });
     const files = keys.filter(k =>
       !k.key.endsWith('/') && !k.key.slice(prefix.length).split('/').includes('preview'));
+    files.sort((a, b) => a.key.slice(prefix.length).localeCompare(
+      b.key.slice(prefix.length), undefined, { numeric: true, sensitivity: 'base' }));
     if (!files.length) {
       return res.status(404).send(errorPage({ title: 'Empty set', body: 'No files in this set.' }));
     }
