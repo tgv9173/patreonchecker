@@ -1733,9 +1733,8 @@ app.get('/library', async (req, res) => {
       }));
     }
 
-    const { prefixes: sub } = await listObjects({ prefix });
     track('library_browse', { patronId, prefix });
-    if (sub.length) {
+    if (/^\d{4}-\d{2}\/$/.test(prefix)) {
       // Folder of sets (a month): group keys by set, newest sets first.
       const allKeys = await listAll(prefix);
       const bySet = new Map();
@@ -1744,10 +1743,14 @@ app.get('/library', async (req, res) => {
         if (!rel.includes('/')) continue;
         const setName = rel.split('/')[0];
         let s = bySet.get(setName);
-        if (!s) { s = { key: prefix + setName, short: setName, cover: k.key, lastModified: k.lastModified }; bySet.set(setName, s); }
-        if (k.key < s.cover) s.cover = k.key;
+        const inPreview = rel.split('/').includes('preview');
+        if (!s) { s = { key: prefix + setName, short: setName, cover: inPreview ? null : k.key, lastModified: k.lastModified }; bySet.set(setName, s); }
+        // Cover: prefer flat (non-preview) images, smallest key first.
+        if (!inPreview && (!s.cover || k.key < s.cover)) s.cover = k.key;
+        if (!s.cover && k.key < (s.coverFallback || '￿')) s.coverFallback = k.key;
         if (k.lastModified > s.lastModified) s.lastModified = k.lastModified;
       }
+      for (const s of bySet.values()) s.cover = s.cover || s.coverFallback;
       let sets = [...bySet.values()];
       for (const s of sets) {
         s.meta = meta.get(s.short);
@@ -1766,10 +1769,12 @@ app.get('/library', async (req, res) => {
       }));
     }
 
-    // A set: gallery view.
+    // A set: gallery view. Image files only, excluding preview/ subfolders
+    // (those hold small duplicate JPGs used for client previews).
     const allKeys = await listAll(prefix);
     const slides = allKeys
-      .filter(k => !k.key.endsWith('/'))
+      .filter(k => !k.key.endsWith('/') && /\.(png|jpe?g|webp|gif)$/i.test(k.key))
+      .filter(k => !k.key.slice(prefix.length).split('/').includes('preview'))
       .map(k => ({
         name: k.key.slice(prefix.length),
         key: k.key,
@@ -1838,7 +1843,8 @@ app.get('/library/zip', async (req, res) => {
   const setName = prefix.replace(/\/$/, '') || 'set';
   try {
     const { keys } = await listObjects({ prefix, delimiter: '' });
-    const files = keys.filter(k => !k.key.endsWith('/'));
+    const files = keys.filter(k =>
+      !k.key.endsWith('/') && !k.key.slice(prefix.length).split('/').includes('preview'));
     if (!files.length) {
       return res.status(404).send(errorPage({ title: 'Empty set', body: 'No files in this set.' }));
     }
